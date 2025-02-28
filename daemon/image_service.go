@@ -31,10 +31,9 @@ type ImageService interface {
 	CreateImage(ctx context.Context, config []byte, parent string, contentStoreDigest digest.Digest) (builder.Image, error)
 	ImageDelete(ctx context.Context, imageRef string, force, prune bool) ([]imagetype.DeleteResponse, error)
 	ExportImage(ctx context.Context, names []string, platform *ocispec.Platform, outStream io.Writer) error
-	PerformWithBaseFS(ctx context.Context, c *container.Container, fn func(string) error) error
 	LoadImage(ctx context.Context, inTar io.ReadCloser, platform *ocispec.Platform, outStream io.Writer, quiet bool) error
 	Images(ctx context.Context, opts imagetype.ListOptions) ([]*imagetype.Summary, error)
-	LogImageEvent(imageID, refName string, action events.Action)
+	LogImageEvent(ctx context.Context, imageID, refName string, action events.Action)
 	CountImages(ctx context.Context) int
 	ImagesPrune(ctx context.Context, pruneFilters filters.Args) (*imagetype.PruneReport, error)
 	ImportImage(ctx context.Context, ref reference.Named, platform *ocispec.Platform, msg string, layerReader io.Reader, changes []string) (image.ID, error)
@@ -45,26 +44,22 @@ type ImageService interface {
 	SquashImage(id, parent string) (string, error)
 	ImageInspect(ctx context.Context, refOrID string, opts backend.ImageInspectOpts) (*imagetype.InspectResponse, error)
 
-	// Containerd related methods
-
-	PrepareSnapshot(ctx context.Context, id string, parentImage string, platform *ocispec.Platform, setupInit func(string) error) error
-
 	// Layers
 
 	GetImageAndReleasableLayer(ctx context.Context, refOrID string, opts backend.GetImageAndLayerOptions) (builder.Image, builder.ROLayer, error)
-	CreateLayer(container *container.Container, initFunc layer.MountInit) (layer.RWLayer, error)
+	CreateLayer(container *container.Container, initFunc layer.MountInit) (container.RWLayer, error)
+	CreateLayerFromImage(img *image.Image, layerName string, rwLayerOpts *layer.CreateRWLayerOpts) (container.RWLayer, error)
+	GetLayerByID(cid string) (container.RWLayer, error)
 	LayerStoreStatus() [][2]string
 	GetLayerMountID(cid string) (string, error)
-	ReleaseLayer(rwlayer layer.RWLayer) error
+	ReleaseLayer(rwlayer container.RWLayer) error
 	LayerDiskUsage(ctx context.Context) (int64, error)
 	GetContainerLayerSize(ctx context.Context, containerID string) (int64, int64, error)
-	Mount(ctx context.Context, container *container.Container) error
-	Unmount(ctx context.Context, container *container.Container) error
 	Changes(ctx context.Context, container *container.Container) ([]archive.Change, error)
 
 	// Windows specific
 
-	GetLayerFolders(img *image.Image, rwLayer layer.RWLayer, containerID string) ([]string, error)
+	GetLayerFolders(img *image.Image, rwLayer container.RWLayer, containerID string) ([]string, error)
 
 	// Build
 

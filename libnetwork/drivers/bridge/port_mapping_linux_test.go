@@ -40,9 +40,9 @@ func TestPortMappingConfig(t *testing.T) {
 		t.Fatalf("Failed to setup driver config: %v", err)
 	}
 
-	binding1 := types.PortBinding{Proto: types.SCTP, Port: uint16(300), HostPort: uint16(65000)}
-	binding2 := types.PortBinding{Proto: types.UDP, Port: uint16(400), HostPort: uint16(54000)}
-	binding3 := types.PortBinding{Proto: types.TCP, Port: uint16(500), HostPort: uint16(65000)}
+	binding1 := types.PortBinding{Proto: types.SCTP, Port: 300, HostPort: 65000}
+	binding2 := types.PortBinding{Proto: types.UDP, Port: 400, HostPort: 54000}
+	binding3 := types.PortBinding{Proto: types.TCP, Port: 500, HostPort: 65000}
 	portBindings := []types.PortBinding{binding1, binding2, binding3}
 
 	sbOptions := make(map[string]interface{})
@@ -67,7 +67,7 @@ func TestPortMappingConfig(t *testing.T) {
 		t.Fatalf("Failed to create the endpoint: %s", err.Error())
 	}
 
-	if err = d.Join(context.Background(), "dummy", "ep1", "sbox", te, sbOptions); err != nil {
+	if err = d.Join(context.Background(), "dummy", "ep1", "sbox", te, nil, sbOptions); err != nil {
 		t.Fatalf("Failed to join the endpoint: %v", err)
 	}
 
@@ -126,9 +126,9 @@ func TestPortMappingV6Config(t *testing.T) {
 	}
 
 	portBindings := []types.PortBinding{
-		{Proto: types.UDP, Port: uint16(400), HostPort: uint16(54000)},
-		{Proto: types.TCP, Port: uint16(500), HostPort: uint16(65000)},
-		{Proto: types.SCTP, Port: uint16(500), HostPort: uint16(65000)},
+		{Proto: types.UDP, Port: 400, HostPort: 54000},
+		{Proto: types.TCP, Port: 500, HostPort: 65000},
+		{Proto: types.SCTP, Port: 500, HostPort: 65000},
 	}
 
 	sbOptions := make(map[string]interface{})
@@ -141,18 +141,19 @@ func TestPortMappingV6Config(t *testing.T) {
 	netOptions[netlabel.GenericData] = netConfig
 
 	ipdList4 := getIPv4Data(t)
-	err := d.CreateNetwork("dummy", netOptions, nil, ipdList4, getIPv6Data(t))
+	ipdList6 := getIPv6Data(t)
+	err := d.CreateNetwork("dummy", netOptions, nil, ipdList4, ipdList6)
 	if err != nil {
 		t.Fatalf("Failed to create bridge: %v", err)
 	}
 
-	te := newTestEndpoint(ipdList4[0].Pool, 11)
+	te := newTestEndpoint46(ipdList4[0].Pool, ipdList6[0].Pool, 11)
 	err = d.CreateEndpoint(context.Background(), "dummy", "ep1", te.Interface(), nil)
 	if err != nil {
 		t.Fatalf("Failed to create the endpoint: %s", err.Error())
 	}
 
-	if err = d.Join(context.Background(), "dummy", "ep1", "sbox", te, sbOptions); err != nil {
+	if err = d.Join(context.Background(), "dummy", "ep1", "sbox", te, nil, sbOptions); err != nil {
 		t.Fatalf("Failed to join the endpoint: %v", err)
 	}
 

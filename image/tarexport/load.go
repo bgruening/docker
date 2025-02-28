@@ -11,7 +11,7 @@ import (
 	"reflect"
 	"runtime"
 
-	"github.com/containerd/containerd/tracing"
+	"github.com/containerd/containerd/v2/pkg/tracing"
 	"github.com/containerd/log"
 	"github.com/distribution/reference"
 	"github.com/docker/distribution"
@@ -159,7 +159,7 @@ func (l *tarexporter) Load(ctx context.Context, inTar io.ReadCloser, outStream i
 		}
 
 		parentLinks = append(parentLinks, parentLink{imgID, m.Parent})
-		l.loggerImgEvent.LogImageEvent(imgID.String(), imgID.String(), events.ActionLoad)
+		l.loggerImgEvent.LogImageEvent(ctx, imgID.String(), imgID.String(), events.ActionLoad)
 	}
 
 	for _, p := range validatedParentLinks(parentLinks) {

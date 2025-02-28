@@ -13,7 +13,7 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/containerd/containerd/cio"
+	"github.com/containerd/containerd/v2/pkg/cio"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	containertypes "github.com/docker/docker/api/types/container"
@@ -28,11 +28,10 @@ import (
 	"github.com/docker/docker/daemon/network"
 	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/image"
-	"github.com/docker/docker/layer"
 	libcontainerdtypes "github.com/docker/docker/libcontainerd/types"
 	"github.com/docker/docker/oci"
+	"github.com/docker/docker/pkg/atomicwriter"
 	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/ioutils"
 	"github.com/docker/docker/restartmanager"
 	"github.com/docker/docker/volume"
 	volumemounts "github.com/docker/docker/volume/mounts"
@@ -50,6 +49,9 @@ import (
 const (
 	configFileName     = "config.v2.json"
 	hostConfigFileName = "hostconfig.json"
+
+	// defaultStopSignal is the default syscall signal used to stop a container.
+	defaultStopSignal = syscall.SIGTERM
 )
 
 // ExitStatus provides exit reasons for a container.
@@ -70,9 +72,9 @@ type Container struct {
 	// State also provides a [sync.Mutex] which is used as lock for both
 	// the Container and State.
 	*State          `json:"State"`
-	Root            string        `json:"-"` // Path to the "home" of the container, including metadata.
-	BaseFS          string        `json:"-"` // Path to the graphdriver mountpoint
-	RWLayer         layer.RWLayer `json:"-"`
+	Root            string  `json:"-"` // Path to the "home" of the container, including metadata.
+	BaseFS          string  `json:"-"` // Path to the graphdriver mountpoint
+	RWLayer         RWLayer `json:"-"`
 	ID              string
 	Created         time.Time
 	Managed         bool
@@ -128,6 +130,7 @@ type SecurityOptions struct {
 	AppArmorProfile string
 	SeccompProfile  string
 	NoNewPrivileges bool
+	WritableCgroups *bool
 }
 
 type localLogCacheMeta struct {
@@ -193,7 +196,7 @@ func (container *Container) toDisk() (*Container, error) {
 	}
 
 	// Save container settings
-	f, err := ioutils.NewAtomicFileWriter(pth, 0o600)
+	f, err := atomicwriter.New(pth, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -273,7 +276,7 @@ func (container *Container) WriteHostConfig() (*containertypes.HostConfig, error
 		return nil, err
 	}
 
-	f, err := ioutils.NewAtomicFileWriter(pth, 0o600)
+	f, err := atomicwriter.New(pth, 0o600)
 	if err != nil {
 		return nil, err
 	}
@@ -578,13 +581,13 @@ func (container *Container) IsDestinationMounted(destination string) bool {
 
 // StopSignal returns the signal used to stop the container.
 func (container *Container) StopSignal() syscall.Signal {
-	var stopSignal syscall.Signal
+	stopSignal := defaultStopSignal
 	if container.Config.StopSignal != "" {
-		stopSignal, _ = signal.ParseSignal(container.Config.StopSignal)
-	}
-
-	if stopSignal == 0 {
-		stopSignal, _ = signal.ParseSignal(defaultStopSignal)
+		// signal.ParseSignal returns "-1" for invalid or unknown signals.
+		sig, err := signal.ParseSignal(container.Config.StopSignal)
+		if err == nil && sig > 0 {
+			stopSignal = sig
+		}
 	}
 	return stopSignal
 }

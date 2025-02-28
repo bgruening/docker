@@ -19,10 +19,11 @@ on:
     branches:
       - 'master'
       - '[0-9]+.[0-9]+'
+      - '[0-9]+.x'
   pull_request:
 
 env:
-  GO_VERSION: "1.23.4"
+  GO_VERSION: "1.23.6"
   GIT_PAGER: "cat"
   PAGER: "cat"
   SETUP_BUILDX_VERSION: edge
@@ -51,9 +52,6 @@ jobs:
             echo "SYSTEMD=true" >> $GITHUB_ENV
           fi
       -
-        name: Checkout
-        uses: actions/checkout@v4
-      -
         name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3
         with:
@@ -62,7 +60,7 @@ jobs:
           buildkitd-flags: --debug
       -
         name: Build dev image
-        uses: docker/bake-action@v4
+        uses: docker/bake-action@v6
         with:
           targets: dev
           set: |
@@ -135,7 +133,7 @@ jobs:
           buildkitd-flags: --debug
       -
         name: Build dev image
-        uses: docker/bake-action@v4
+        uses: docker/bake-action@v6
         with:
           targets: dev
           set: |
@@ -178,9 +176,6 @@ jobs:
         platform: ${{ fromJson(needs.smoke-prepare.outputs.matrix) }}
     steps:
       -
-        name: Checkout
-        uses: actions/checkout@v4
-      -
         name: Prepare
         run: |
           platform=${{ matrix.platform }}
@@ -197,7 +192,7 @@ jobs:
           buildkitd-flags: --debug
       -
         name: Test
-        uses: docker/bake-action@v4
+        uses: docker/bake-action@v6
         with:
           targets: binary-smoketest
           set: |
