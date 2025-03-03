@@ -97,7 +97,7 @@ type Controller struct {
 	agentInitDone    chan struct{}
 	agentStopDone    chan struct{}
 	keys             []*types.EncryptionKey
-	DiagnosticServer *diagnostic.Server
+	diagnosticServer *diagnostic.Server
 	mu               sync.Mutex
 
 	// FIXME(thaJeztah): defOsSbox is always nil on non-Linux: move these fields to Linux-only files.
@@ -122,7 +122,7 @@ func New(cfgOptions ...config.Option) (*Controller, error) {
 		serviceBindings:  make(map[serviceKey]*service),
 		agentInitDone:    make(chan struct{}),
 		networkLocker:    locker.New(),
-		DiagnosticServer: diagnostic.New(),
+		diagnosticServer: diagnostic.New(),
 	}
 
 	c.drvRegistry.Notify = c
@@ -155,10 +155,11 @@ func New(cfgOptions ...config.Option) (*Controller, error) {
 	// generate many unnecessary warnings
 	c.reservePools()
 
-	// Cleanup resources
-	if err := c.sandboxCleanup(c.cfg.ActiveSandboxes); err != nil {
+	if err := c.sandboxRestore(c.cfg.ActiveSandboxes); err != nil {
 		log.G(context.TODO()).WithError(err).Error("error during sandbox cleanup")
 	}
+
+	// Cleanup resources
 	if err := c.cleanupLocalEndpoints(); err != nil {
 		log.G(context.TODO()).WithError(err).Warnf("error during endpoint cleanup")
 	}
@@ -473,7 +474,7 @@ func (c *Controller) NewNetwork(networkType, name string, id string, options ...
 	}
 
 	if strings.TrimSpace(name) == "" {
-		return nil, ErrInvalidName(name)
+		return nil, types.InvalidParameterErrorf("invalid name: name is empty")
 	}
 
 	// Make sure two concurrent calls to this method won't create conflicting
@@ -498,6 +499,7 @@ func (c *Controller) NewNetwork(networkType, name string, id string, options ...
 		networkType:      networkType,
 		generic:          map[string]interface{}{netlabel.GenericData: make(map[string]string)},
 		ipamType:         defaultIpam,
+		enableIPv4:       true,
 		id:               id,
 		created:          time.Now(),
 		ctrlr:            c,
@@ -542,6 +544,25 @@ func (c *Controller) NewNetwork(networkType, name string, id string, options ...
 		return nil, types.ForbiddenErrorf("Ingress network can only be global scope network")
 	}
 
+	// From this point on, we need the network specific configuration,
+	// which may come from a configuration-only network
+	if nw.configFrom != "" {
+		configNetwork, err := c.getConfigNetwork(nw.configFrom)
+		if err != nil {
+			return nil, types.NotFoundErrorf("configuration network %q does not exist", nw.configFrom)
+		}
+		if err := configNetwork.applyConfigurationTo(nw); err != nil {
+			return nil, types.InternalErrorf("Failed to apply configuration: %v", err)
+		}
+		defer func() {
+			if retErr == nil && !skipCfgEpCount {
+				if err := configNetwork.getEpCnt().IncEndpointCnt(); err != nil {
+					log.G(context.TODO()).Warnf("Failed to update reference count for configuration network %q on creation of network %q: %v", configNetwork.Name(), nw.name, err)
+				}
+			}
+		}()
+	}
+
 	// At this point the network scope is still unknown if not set by user
 	if (caps.DataScope == scope.Global || nw.scope == scope.Swarm) &&
 		c.isSwarmNode() && !nw.dynamic {
@@ -561,28 +582,14 @@ func (c *Controller) NewNetwork(networkType, name string, id string, options ...
 
 	// Make sure we have a driver available for this network type
 	// before we allocate anything.
-	if _, err := nw.driver(true); err != nil {
+	if d, err := nw.driver(true); err != nil {
 		return nil, err
-	}
-
-	// From this point on, we need the network specific configuration,
-	// which may come from a configuration-only network
-	if nw.configFrom != "" {
-		configNetwork, err := c.getConfigNetwork(nw.configFrom)
+	} else if gac, ok := d.(driverapi.GwAllocChecker); ok {
+		// Give the driver a chance to say it doesn't need a gateway IP address.
+		nw.skipGwAllocIPv4, nw.skipGwAllocIPv6, err = gac.GetSkipGwAlloc(nw.generic)
 		if err != nil {
-			return nil, types.NotFoundErrorf("configuration network %q does not exist", nw.configFrom)
+			return nil, err
 		}
-		if err := configNetwork.applyConfigurationTo(nw); err != nil {
-			return nil, types.InternalErrorf("Failed to apply configuration: %v", err)
-		}
-		nw.generic[netlabel.Internal] = nw.internal
-		defer func() {
-			if retErr == nil && !skipCfgEpCount {
-				if err := configNetwork.getEpCnt().IncEndpointCnt(); err != nil {
-					log.G(context.TODO()).Warnf("Failed to update reference count for configuration network %q on creation of network %q: %v", configNetwork.Name(), nw.name, err)
-				}
-			}
-		}()
 	}
 
 	if err := nw.ipamAllocate(); err != nil {
@@ -830,7 +837,7 @@ func (c *Controller) WalkNetworks(walker NetworkWalker) {
 // If not found, the error [ErrNoSuchNetwork] is returned.
 func (c *Controller) NetworkByName(name string) (*Network, error) {
 	if name == "" {
-		return nil, ErrInvalidName(name)
+		return nil, types.InvalidParameterErrorf("invalid name: name is empty")
 	}
 	var n *Network
 
@@ -853,7 +860,7 @@ func (c *Controller) NetworkByName(name string) (*Network, error) {
 // If not found, the error [ErrNoSuchNetwork] is returned.
 func (c *Controller) NetworkByID(id string) (*Network, error) {
 	if id == "" {
-		return nil, ErrInvalidID(id)
+		return nil, types.InvalidParameterErrorf("invalid id: id is empty")
 	}
 	return c.getNetworkFromStore(id)
 }
@@ -967,7 +974,7 @@ func (c *Controller) NewSandbox(ctx context.Context, containerID string, options
 // [types.NotFoundError] if no Sandbox was found for the container.
 func (c *Controller) GetSandbox(containerID string) (*Sandbox, error) {
 	if containerID == "" {
-		return nil, ErrInvalidID("id is empty")
+		return nil, types.InvalidParameterErrorf("invalid id: id is empty")
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
@@ -991,7 +998,7 @@ func (c *Controller) GetSandbox(containerID string) (*Sandbox, error) {
 // If not found, a [types.NotFoundError] is returned.
 func (c *Controller) SandboxByID(id string) (*Sandbox, error) {
 	if id == "" {
-		return nil, ErrInvalidID(id)
+		return nil, types.InvalidParameterErrorf("invalid id: id is empty")
 	}
 	c.mu.Lock()
 	s, ok := c.sandboxes[id]
@@ -1086,25 +1093,15 @@ func (c *Controller) Stop() {
 
 // StartDiagnostic starts the network diagnostic server listening on port.
 func (c *Controller) StartDiagnostic(port int) {
-	c.mu.Lock()
-	if !c.DiagnosticServer.IsDiagnosticEnabled() {
-		c.DiagnosticServer.EnableDiagnostic("127.0.0.1", port)
-	}
-	c.mu.Unlock()
+	c.diagnosticServer.Enable("127.0.0.1", port)
 }
 
 // StopDiagnostic stops the network diagnostic server.
 func (c *Controller) StopDiagnostic() {
-	c.mu.Lock()
-	if c.DiagnosticServer.IsDiagnosticEnabled() {
-		c.DiagnosticServer.DisableDiagnostic()
-	}
-	c.mu.Unlock()
+	c.diagnosticServer.Shutdown()
 }
 
 // IsDiagnosticEnabled returns true if the diagnostic server is running.
 func (c *Controller) IsDiagnosticEnabled() bool {
-	c.mu.Lock()
-	defer c.mu.Unlock()
-	return c.DiagnosticServer.IsDiagnosticEnabled()
+	return c.diagnosticServer.Enabled()
 }
