@@ -6,17 +6,16 @@ import (
 	"io"
 	"strings"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/content"
-	c8dimages "github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/images/archive"
-	"github.com/containerd/containerd/leases"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/content"
+	c8dimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/images/archive"
+	"github.com/containerd/containerd/v2/core/leases"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"github.com/distribution/reference"
 	"github.com/docker/docker/api/types/events"
-	"github.com/docker/docker/container"
 	"github.com/docker/docker/daemon/images"
 	"github.com/docker/docker/errdefs"
 	dockerarchive "github.com/docker/docker/pkg/archive"
@@ -24,21 +23,6 @@ import (
 	ocispec "github.com/opencontainers/image-spec/specs-go/v1"
 	"github.com/pkg/errors"
 )
-
-func (i *ImageService) PerformWithBaseFS(ctx context.Context, c *container.Container, fn func(root string) error) error {
-	snapshotter := i.client.SnapshotService(c.Driver)
-	mounts, err := snapshotter.Mounts(ctx, c.ID)
-	if err != nil {
-		return err
-	}
-	path, err := i.refCountMounter.Mount(mounts, c.ID)
-	if err != nil {
-		return err
-	}
-	defer i.refCountMounter.Unmount(path)
-
-	return fn(path)
-}
 
 // ExportImage exports a list of images to the given output stream. The
 // exported images are archived into a tar when written to the output
@@ -121,7 +105,7 @@ func (i *ImageService) ExportImage(ctx context.Context, names []string, platform
 			}).Debug("export image without name")
 		}
 
-		i.LogImageEvent(target.Digest.String(), target.Digest.String(), events.ActionSave)
+		i.LogImageEvent(ctx, target.Digest.String(), target.Digest.String(), events.ActionSave)
 		return nil
 	}
 
@@ -368,7 +352,7 @@ func (i *ImageService) LoadImage(ctx context.Context, inTar io.ReadCloser, platf
 		})
 
 		fmt.Fprintf(progress, "%s: %s\n", loadedMsg, name)
-		i.LogImageEvent(img.Target.Digest.String(), img.Target.Digest.String(), events.ActionLoad)
+		i.LogImageEvent(ctx, img.Target.Digest.String(), img.Target.Digest.String(), events.ActionLoad)
 
 		if err != nil {
 			// The image failed to unpack, but is already imported, log the error but don't fail the whole load.
@@ -419,7 +403,7 @@ func (i *ImageService) verifyImagesProvidePlatform(ctx context.Context, imgs []c
 		}
 	}
 
-	msg := ""
+	var msg string
 	switch len(incompleteImgs) {
 	case 0:
 		// Success - All images provide the requested platform.

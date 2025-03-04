@@ -1,4 +1,4 @@
-package idtools // import "github.com/docker/docker/pkg/idtools"
+package idtools
 
 import (
 	"os"
@@ -8,9 +8,11 @@ const (
 	SeTakeOwnershipPrivilege = "SeTakeOwnershipPrivilege"
 )
 
+// TODO(thaJeztah): these magic consts need a source of reference, and should be defined in a canonical location
 const (
 	ContainerAdministratorSidString = "S-1-5-93-2-1"
-	ContainerUserSidString          = "S-1-5-93-2-2"
+
+	ContainerUserSidString = "S-1-5-93-2-2"
 )
 
 // This is currently a wrapper around [os.MkdirAll] since currently
