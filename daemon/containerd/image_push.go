@@ -8,11 +8,11 @@ import (
 	"sync"
 	"time"
 
-	"github.com/containerd/containerd/content"
-	c8dimages "github.com/containerd/containerd/images"
-	containerdlabels "github.com/containerd/containerd/labels"
-	"github.com/containerd/containerd/remotes"
-	"github.com/containerd/containerd/remotes/docker"
+	"github.com/containerd/containerd/v2/core/content"
+	c8dimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/remotes"
+	"github.com/containerd/containerd/v2/core/remotes/docker"
+	containerdlabels "github.com/containerd/containerd/v2/pkg/labels"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
@@ -20,8 +20,8 @@ import (
 	"github.com/docker/docker/api/types/auxprogress"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/api/types/registry"
-	"github.com/docker/docker/daemon/images"
 	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/internal/metrics"
 	"github.com/docker/docker/pkg/progress"
 	"github.com/docker/docker/pkg/streamformatter"
 	"github.com/opencontainers/go-digest"
@@ -44,7 +44,7 @@ func (i *ImageService) PushImage(ctx context.Context, sourceRef reference.Named,
 	start := time.Now()
 	defer func() {
 		if retErr == nil {
-			images.ImageActions.WithValues("push").UpdateSince(start)
+			metrics.ImageActions.WithValues("push").UpdateSince(start)
 		}
 	}()
 	out := streamformatter.NewJSONProgressOutput(outStream, false)
@@ -209,7 +209,7 @@ func (i *ImageService) pushRef(ctx context.Context, targetRef reference.Named, p
 
 	appendDistributionSourceLabel(ctx, realStore, targetRef, target)
 
-	i.LogImageEvent(reference.FamiliarString(targetRef), reference.FamiliarName(targetRef), events.ActionPush)
+	i.LogImageEvent(ctx, reference.FamiliarString(targetRef), reference.FamiliarName(targetRef), events.ActionPush)
 
 	return nil
 }

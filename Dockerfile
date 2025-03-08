@@ -1,19 +1,22 @@
 # syntax=docker/dockerfile:1.7
 
-ARG GO_VERSION=1.23.4
+ARG GO_VERSION=1.23.7
 ARG BASE_DEBIAN_DISTRO="bookworm"
 ARG GOLANG_IMAGE="golang:${GO_VERSION}-${BASE_DEBIAN_DISTRO}"
 ARG XX_VERSION=1.6.1
 
 ARG VPNKIT_VERSION=0.5.0
 
+# DOCKERCLI_VERSION is the version of the CLI to install in the dev-container.
+ARG DOCKERCLI_VERSION=v28.0.1
 ARG DOCKERCLI_REPOSITORY="https://github.com/docker/cli.git"
-ARG DOCKERCLI_VERSION=v27.3.1
+
 # cli version used for integration-cli tests
 ARG DOCKERCLI_INTEGRATION_REPOSITORY="https://github.com/docker/cli.git"
 ARG DOCKERCLI_INTEGRATION_VERSION=v17.06.2-ce
-ARG BUILDX_VERSION=0.18.0
-ARG COMPOSE_VERSION=v2.30.3
+# BUILDX_VERSION is the version of buildx to install in the dev container.
+ARG BUILDX_VERSION=0.20.1
+ARG COMPOSE_VERSION=v2.33.1
 
 ARG SYSTEMD="false"
 ARG FIREWALLD="false"
@@ -167,19 +170,6 @@ EOT
 FROM binary-dummy AS delve-unsupported
 FROM delve-${DELVE_SUPPORTED} AS delve
 
-FROM base AS tomll
-# GOTOML_VERSION specifies the version of the tomll binary to build and install
-# from the https://github.com/pelletier/go-toml repository. This binary is used
-# in CI in the hack/validate/toml script.
-#
-# When updating this version, consider updating the github.com/pelletier/go-toml
-# dependency in vendor.mod accordingly.
-ARG GOTOML_VERSION=v1.8.1
-RUN --mount=type=cache,target=/root/.cache/go-build \
-    --mount=type=cache,target=/go/pkg/mod \
-        GOBIN=/build/ GO111MODULE=on go install "github.com/pelletier/go-toml/cmd/tomll@${GOTOML_VERSION}" \
-     && /build/tomll --help
-
 FROM base AS gowinres
 # GOWINRES_VERSION defines go-winres tool version
 ARG GOWINRES_VERSION=v0.3.1
@@ -199,7 +189,7 @@ RUN git init . && git remote add origin "https://github.com/containerd/container
 # When updating the binary version you may also need to update the vendor
 # version to pick up bug fixes or new APIs, however, usually the Go packages
 # are built from a commit from the master branch.
-ARG CONTAINERD_VERSION=v1.7.24
+ARG CONTAINERD_VERSION=v1.7.25
 RUN git fetch -q --depth 1 origin "${CONTAINERD_VERSION}" +refs/tags/*:refs/tags/* && git checkout -q FETCH_HEAD
 
 FROM base AS containerd-build
@@ -230,14 +220,14 @@ FROM binary-dummy AS containerd-windows
 FROM containerd-${TARGETOS} AS containerd
 
 FROM base AS golangci_lint
-ARG GOLANGCI_LINT_VERSION=v1.62.0
+ARG GOLANGCI_LINT_VERSION=v1.64.5
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
         GOBIN=/build/ GO111MODULE=on go install "github.com/golangci/golangci-lint/cmd/golangci-lint@${GOLANGCI_LINT_VERSION}" \
      && /build/golangci-lint --version
 
 FROM base AS gotestsum
-ARG GOTESTSUM_VERSION=v1.8.2
+ARG GOTESTSUM_VERSION=v1.12.0
 RUN --mount=type=cache,target=/root/.cache/go-build \
     --mount=type=cache,target=/go/pkg/mod \
         GOBIN=/build/ GO111MODULE=on go install "gotest.tools/gotestsum@${GOTESTSUM_VERSION}" \
@@ -266,7 +256,8 @@ RUN --mount=source=hack/dockerfile/cli.sh,target=/download-or-build-cli.sh \
     --mount=type=cache,target=/root/.cache/go-build,id=dockercli-build-$TARGETPLATFORM \
         rm -f ./.git/*.lock \
      && /download-or-build-cli.sh ${DOCKERCLI_VERSION} ${DOCKERCLI_REPOSITORY} /build \
-     && /build/docker --version
+     && /build/docker --version \
+     && /build/docker completion bash >/completion.bash
 
 FROM base AS dockercli-integration
 WORKDIR /go/src/github.com/docker/cli
@@ -288,7 +279,7 @@ RUN git init . && git remote add origin "https://github.com/opencontainers/runc.
 # that is used. If you need to update runc, open a pull request in the containerd
 # project first, and update both after that is merged. When updating RUNC_VERSION,
 # consider updating runc in vendor.mod accordingly.
-ARG RUNC_VERSION=v1.2.3
+ARG RUNC_VERSION=v1.2.5
 RUN git fetch -q --depth 1 origin "${RUNC_VERSION}" +refs/tags/*:refs/tags/* && git checkout -q FETCH_HEAD
 
 FROM base AS runc-build
@@ -356,7 +347,7 @@ FROM base AS rootlesskit-src
 WORKDIR /usr/src/rootlesskit
 RUN git init . && git remote add origin "https://github.com/rootless-containers/rootlesskit.git"
 # When updating, also update vendor.mod and hack/dockerfile/install/rootlesskit.installer accordingly.
-ARG ROOTLESSKIT_VERSION=v2.3.1
+ARG ROOTLESSKIT_VERSION=v2.3.2
 RUN git fetch -q --depth 1 origin "${ROOTLESSKIT_VERSION}" +refs/tags/*:refs/tags/* && git checkout -q FETCH_HEAD
 
 FROM base AS rootlesskit-build
@@ -450,14 +441,13 @@ FROM binary-dummy AS containerutil-linux
 FROM containerutil-build AS containerutil-windows-amd64
 FROM containerutil-windows-${TARGETARCH} AS containerutil-windows
 FROM containerutil-${TARGETOS} AS containerutil
-FROM docker/buildx-bin:${BUILDX_VERSION} as buildx
-FROM docker/compose-bin:${COMPOSE_VERSION} as compose
+FROM docker/buildx-bin:${BUILDX_VERSION} AS buildx
+FROM docker/compose-bin:${COMPOSE_VERSION} AS compose
 
 FROM base AS dev-systemd-false
 COPY --link --from=frozen-images /build/ /docker-frozen-images
 COPY --link --from=swagger       /build/ /usr/local/bin/
 COPY --link --from=delve         /build/ /usr/local/bin/
-COPY --link --from=tomll         /build/ /usr/local/bin/
 COPY --link --from=gowinres      /build/ /usr/local/bin/
 COPY --link --from=tini          /build/ /usr/local/bin/
 COPY --link --from=registry      /build/ /usr/local/bin/
@@ -517,9 +507,8 @@ RUN useradd --create-home --gid docker unprivilegeduser \
  && chown -R unprivilegeduser /home/unprivilegeduser
 # Let us use a .bashrc file
 RUN ln -sfv /go/src/github.com/docker/docker/.bashrc ~/.bashrc
-# Activate bash completion and include Docker's completion if mounted with DOCKER_BASH_COMPLETION_PATH
+# Activate bash completion
 RUN echo "source /usr/share/bash-completion/bash_completion" >> /etc/bash.bashrc
-RUN ln -s /usr/local/completion/bash/docker /etc/bash_completion.d/docker
 RUN ldconfig
 # Set dev environment as safe git directory to prevent "dubious ownership" errors
 # when bind-mounting the source into the dev-container. See https://github.com/moby/moby/pull/44930
@@ -535,6 +524,7 @@ RUN --mount=type=cache,sharing=locked,id=moby-dev-aptlib,target=/var/lib/apt \
             inetutils-ping \
             iproute2 \
             iptables \
+            nftables \
             jq \
             libcap2-bin \
             libnet1 \
@@ -542,6 +532,7 @@ RUN --mount=type=cache,sharing=locked,id=moby-dev-aptlib,target=/var/lib/apt \
             libprotobuf-c1 \
             libyajl2 \
             net-tools \
+            netcat-openbsd \
             patch \
             pigz \
             sudo \
@@ -554,11 +545,6 @@ RUN --mount=type=cache,sharing=locked,id=moby-dev-aptlib,target=/var/lib/apt \
             xz-utils \
             zip \
             zstd
-# Switch to use iptables instead of nftables (to match the CI hosts)
-# TODO use some kind of runtime auto-detection instead if/when nftables is supported (https://github.com/moby/moby/issues/26824)
-RUN update-alternatives --set iptables  /usr/sbin/iptables-legacy  || true \
- && update-alternatives --set ip6tables /usr/sbin/ip6tables-legacy || true \
- && update-alternatives --set arptables /usr/sbin/arptables-legacy || true
 RUN --mount=type=cache,sharing=locked,id=moby-dev-aptlib,target=/var/lib/apt \
     --mount=type=cache,sharing=locked,id=moby-dev-aptcache,target=/var/cache/apt \
         apt-get update && apt-get install --no-install-recommends -y \
@@ -568,6 +554,7 @@ RUN --mount=type=cache,sharing=locked,id=moby-dev-aptlib,target=/var/lib/apt \
             libsystemd-dev \
             yamllint
 COPY --link --from=dockercli             /build/ /usr/local/cli
+COPY --link --from=dockercli             /completion.bash /etc/bash_completion.d/docker
 COPY --link --from=dockercli-integration /build/ /usr/local/cli-integration
 
 FROM base AS build
@@ -645,7 +632,7 @@ COPY --link --from=build         /build  /
 # smoke tests
 # usage:
 # > docker buildx bake binary-smoketest
-FROM --platform=$TARGETPLATFORM base AS smoketest
+FROM base AS smoketest
 WORKDIR /usr/local/bin
 COPY --from=build /build .
 RUN <<EOT

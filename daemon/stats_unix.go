@@ -44,8 +44,9 @@ func (daemon *Daemon) stats(c *container.Container) (*containertypes.StatsRespon
 		}
 		return nil, err
 	}
-	s := &containertypes.StatsResponse{}
-	s.Read = cs.Read
+	s := &containertypes.StatsResponse{
+		Read: cs.Read,
+	}
 	stats := cs.Metrics
 	switch t := stats.(type) {
 	case *statsV1.Metrics:
@@ -318,7 +319,7 @@ const (
 // statistics line and then sums up the first seven fields
 // provided. See `man 5 proc` for details on specific field
 // information.
-func getSystemCPUUsage() (cpuUsage uint64, cpuNum uint32, err error) {
+func getSystemCPUUsage() (cpuUsage uint64, cpuNum uint32, _ error) {
 	f, err := os.Open("/proc/stat")
 	if err != nil {
 		return 0, 0, err
@@ -340,7 +341,7 @@ func getSystemCPUUsage() (cpuUsage uint64, cpuNum uint32, err error) {
 			for _, i := range parts[1:8] {
 				v, err := strconv.ParseUint(i, 10, 64)
 				if err != nil {
-					return 0, 0, fmt.Errorf("Unable to convert value %s to int: %w", i, err)
+					return 0, 0, fmt.Errorf("unable to convert value %s to int: %w", i, err)
 				}
 				totalClockTicks += v
 			}
@@ -355,5 +356,5 @@ func getSystemCPUUsage() (cpuUsage uint64, cpuNum uint32, err error) {
 	if err := scanner.Err(); err != nil {
 		return 0, 0, fmt.Errorf("error scanning '/proc/stat' file: %w", err)
 	}
-	return
+	return cpuUsage, cpuNum, nil
 }

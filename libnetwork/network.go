@@ -6,6 +6,7 @@ package libnetwork
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net"
 	"net/netip"
@@ -15,6 +16,7 @@ import (
 	"time"
 
 	"github.com/containerd/log"
+	"github.com/docker/docker/errdefs"
 	"github.com/docker/docker/libnetwork/datastore"
 	"github.com/docker/docker/libnetwork/driverapi"
 	"github.com/docker/docker/libnetwork/internal/netiputil"
@@ -156,7 +158,7 @@ func (i *IpamInfo) UnmarshalJSON(data []byte) error {
 	}
 	i.PoolID = m["PoolID"].(string)
 	if v, ok := m["Meta"]; ok {
-		b, _ := json.Marshal(v)
+		b, _ := json.Marshal(v) //nolint:errchkjson // FIXME: handle json (Un)Marshal errors
 		if err = json.Unmarshal(b, &i.Meta); err != nil {
 			return err
 		}
@@ -188,7 +190,6 @@ type Network struct {
 	ipamV6Info       []*IpamInfo
 	enableIPv4       bool
 	enableIPv6       bool
-	postIPv6         bool
 	epCnt            *endpointCnt
 	generic          options.Generic
 	dbIndex          uint64
@@ -206,6 +207,8 @@ type Network struct {
 	configFrom       string
 	loadBalancerIP   net.IP
 	loadBalancerMode string
+	skipGwAllocIPv4  bool
+	skipGwAllocIPv6  bool
 	platformNetwork  //nolint:nolintlint,unused // only populated on windows
 	mu               sync.Mutex
 }
@@ -362,13 +365,20 @@ func (n *Network) validateConfiguration() error {
 				"[ ingress | internal | attachable | scope ] are not supported.")
 		}
 	}
-	if n.configFrom != "" {
+	if n.configFrom == "" {
+		if err := n.validateAdvertiseAddrConfig(); err != nil {
+			return err
+		}
+	} else {
 		if n.configOnly {
 			return types.ForbiddenErrorf("a configuration network cannot depend on another configuration network")
 		}
+		// Check that no config has been set for this --config-from network.
+		// (Note that the default for enableIPv4 is 'true', ipamType has its own default,
+		// and other settings are zero valued by default.)
 		if n.ipamType != "" &&
 			n.ipamType != defaultIpamForNetworkType(n.networkType) ||
-			n.enableIPv4 || n.enableIPv6 ||
+			!n.enableIPv4 || n.enableIPv6 ||
 			len(n.labels) > 0 || len(n.ipamOptions) > 0 ||
 			len(n.ipamV4Config) > 0 || len(n.ipamV6Config) > 0 {
 			return types.ForbiddenErrorf("user specified configurations are not supported if the network depends on a configuration network")
@@ -436,6 +446,15 @@ func (n *Network) applyConfigurationTo(to *Network) error {
 			to.generic[k] = v
 		}
 	}
+
+	// Network drivers only see generic flags. So, make sure they match.
+	if to.generic == nil {
+		to.generic = options.Generic{}
+	}
+	to.generic[netlabel.Internal] = to.internal
+	to.generic[netlabel.EnableIPv4] = to.enableIPv4
+	to.generic[netlabel.EnableIPv6] = to.enableIPv6
+
 	return nil
 }
 
@@ -454,7 +473,6 @@ func (n *Network) CopyTo(o datastore.KVObject) error {
 	dstN.enableIPv4 = n.enableIPv4
 	dstN.enableIPv6 = n.enableIPv6
 	dstN.persist = n.persist
-	dstN.postIPv6 = n.postIPv6
 	dstN.dbIndex = n.dbIndex
 	dstN.dbExists = n.dbExists
 	dstN.drvOnce = n.drvOnce
@@ -466,6 +484,8 @@ func (n *Network) CopyTo(o datastore.KVObject) error {
 	dstN.configFrom = n.configFrom
 	dstN.loadBalancerIP = n.loadBalancerIP
 	dstN.loadBalancerMode = n.loadBalancerMode
+	dstN.skipGwAllocIPv4 = n.skipGwAllocIPv4
+	dstN.skipGwAllocIPv6 = n.skipGwAllocIPv6
 
 	// copy labels
 	if dstN.labels == nil {
@@ -529,6 +549,35 @@ func (n *Network) getEpCnt() *endpointCnt {
 	return n.epCnt
 }
 
+func (n *Network) validateAdvertiseAddrConfig() error {
+	var errs []error
+	_, err := n.validatedAdvertiseAddrNMsgs()
+	errs = append(errs, err)
+	_, err = n.validatedAdvertiseAddrInterval()
+	errs = append(errs, err)
+	return errors.Join(errs...)
+}
+
+func (n *Network) advertiseAddrNMsgs() (int, bool) {
+	v, err := n.validatedAdvertiseAddrNMsgs()
+	if err != nil || v == nil {
+		// On Linux, config was validated before network creation. This
+		// path is for un-set values and unsupported platforms.
+		return 0, false
+	}
+	return *v, true
+}
+
+func (n *Network) advertiseAddrInterval() (time.Duration, bool) {
+	v, err := n.validatedAdvertiseAddrInterval()
+	if err != nil || v == nil {
+		// On Linux, config was validated before network creation. This
+		// path is for un-set values and unsupported platforms.
+		return 0, false
+	}
+	return *v, true
+}
+
 // TODO : Can be made much more generic with the help of reflection (but has some golang limitations)
 func (n *Network) MarshalJSON() ([]byte, error) {
 	netMap := make(map[string]interface{})
@@ -547,7 +596,6 @@ func (n *Network) MarshalJSON() ([]byte, error) {
 		netMap["generic"] = n.generic
 	}
 	netMap["persist"] = n.persist
-	netMap["postIPv6"] = n.postIPv6
 	if len(n.ipamV4Config) > 0 {
 		ics, err := json.Marshal(n.ipamV4Config)
 		if err != nil {
@@ -584,6 +632,8 @@ func (n *Network) MarshalJSON() ([]byte, error) {
 	netMap["configFrom"] = n.configFrom
 	netMap["loadBalancerIP"] = n.loadBalancerIP
 	netMap["loadBalancerMode"] = n.loadBalancerMode
+	netMap["skipGwAllocIPv4"] = n.skipGwAllocIPv4
+	netMap["skipGwAllocIPv6"] = n.skipGwAllocIPv6
 	return json.Marshal(netMap)
 }
 
@@ -604,11 +654,9 @@ func (n *Network) UnmarshalJSON(b []byte) (err error) {
 		}
 	}
 	n.networkType = netMap["networkType"].(string)
+	n.enableIPv4 = true // Default for networks created before the option to disable IPv4 was added.
 	if v, ok := netMap["enableIPv4"]; ok {
 		n.enableIPv4 = v.(bool)
-	} else {
-		// Set enableIPv4 for IPv4 networks created before the option was added.
-		_, n.enableIPv4 = netMap["ipamV4Info"]
 	}
 	n.enableIPv6 = netMap["enableIPv6"].(bool)
 
@@ -647,9 +695,6 @@ func (n *Network) UnmarshalJSON(b []byte) (err error) {
 	}
 	if v, ok := netMap["persist"]; ok {
 		n.persist = v.(bool)
-	}
-	if v, ok := netMap["postIPv6"]; ok {
-		n.postIPv6 = v.(bool)
 	}
 	if v, ok := netMap["ipamType"]; ok {
 		n.ipamType = v.(string)
@@ -706,6 +751,12 @@ func (n *Network) UnmarshalJSON(b []byte) (err error) {
 	n.loadBalancerMode = loadBalancerModeDefault
 	if v, ok := netMap["loadBalancerMode"]; ok {
 		n.loadBalancerMode = v.(string)
+	}
+	if v, ok := netMap["skipGwAllocIPv4"]; ok {
+		n.skipGwAllocIPv4 = v.(bool)
+	}
+	if v, ok := netMap["skipGwAllocIPv6"]; ok {
+		n.skipGwAllocIPv6 = v.(bool)
 	}
 	return nil
 }
@@ -852,16 +903,6 @@ func NetworkOptionDynamic() NetworkOption {
 	}
 }
 
-// NetworkOptionDeferIPv6Alloc instructs the network to defer the IPV6 address allocation until after the endpoint has been created
-// It is being provided to support the specific docker daemon flags where user can deterministically assign an IPv6 address
-// to a container as combination of fixed-cidr-v6 + mac-address
-// TODO: Remove this option setter once we support endpoint ipam options
-func NetworkOptionDeferIPv6Alloc(enable bool) NetworkOption {
-	return func(n *Network) {
-		n.postIPv6 = enable
-	}
-}
-
 // NetworkOptionConfigOnly tells controller this network is
 // a configuration only network. It serves as a configuration
 // for other networks.
@@ -991,7 +1032,7 @@ func (n *Network) delete(force bool, rmLBEndpoint bool) error {
 
 	n, err := c.getNetworkFromStore(id)
 	if err != nil {
-		return &UnknownNetworkError{name: name, id: id}
+		return errdefs.NotFound(fmt.Errorf("unknown network %s id %s", name, id))
 	}
 
 	// Only remove ingress on force removal or explicit LB endpoint removal
@@ -1024,7 +1065,7 @@ func (n *Network) delete(force bool, rmLBEndpoint bool) error {
 		// Reload the network from the store to update the epcnt.
 		n, err = c.getNetworkFromStore(id)
 		if err != nil {
-			return &UnknownNetworkError{name: name, id: id}
+			return errdefs.NotFound(fmt.Errorf("unknown network %s id %s", name, id))
 		}
 	}
 
@@ -1146,7 +1187,7 @@ func (n *Network) addEndpoint(ctx context.Context, ep *Endpoint) error {
 func (n *Network) CreateEndpoint(ctx context.Context, name string, options ...EndpointOption) (*Endpoint, error) {
 	var err error
 	if strings.TrimSpace(name) == "" {
-		return nil, ErrInvalidName(name)
+		return nil, types.InvalidParameterErrorf("invalid name: name is empty")
 	}
 
 	if n.ConfigOnly() {
@@ -1210,7 +1251,7 @@ func (n *Network) createEndpoint(ctx context.Context, name string, options ...En
 
 	wantIPv6 := n.enableIPv6 && !ep.disableIPv6
 
-	if err = ep.assignAddress(ipam, n.enableIPv4, wantIPv6 && !n.postIPv6); err != nil {
+	if err = ep.assignAddress(ipam, n.enableIPv4, wantIPv6); err != nil {
 		return nil, err
 	}
 	defer func() {
@@ -1242,14 +1283,6 @@ func (n *Network) createEndpoint(ctx context.Context, name string, options ...En
 			}
 		}
 	}()
-
-	if wantIPv6 {
-		if err = ep.assignAddress(ipam, false, n.postIPv6); err != nil {
-			return nil, err
-		}
-	} else {
-		ep.iface.addrv6 = nil
-	}
 
 	if !n.getController().isSwarmNode() || n.Scope() != scope.Swarm || !n.driverIsMultihost() {
 		n.updateSvcRecord(context.WithoutCancel(ctx), ep, true)
@@ -1287,10 +1320,10 @@ func (n *Network) WalkEndpoints(walker EndpointWalker) {
 }
 
 // EndpointByName returns the Endpoint which has the passed name. If not found,
-// the error ErrNoSuchEndpoint is returned.
+// an [errdefs.ErrNotFound] is returned.
 func (n *Network) EndpointByName(name string) (*Endpoint, error) {
 	if name == "" {
-		return nil, ErrInvalidName(name)
+		return nil, types.InvalidParameterErrorf("invalid name: name is empty")
 	}
 	var e *Endpoint
 
@@ -1305,25 +1338,10 @@ func (n *Network) EndpointByName(name string) (*Endpoint, error) {
 	n.WalkEndpoints(s)
 
 	if e == nil {
-		return nil, ErrNoSuchEndpoint(name)
+		return nil, errdefs.NotFound(fmt.Errorf("endpoint %s not found", name))
 	}
 
 	return e, nil
-}
-
-// EndpointByID should *never* be called as it's going to create a 2nd instance of an Endpoint. The first one lives in
-// the Sandbox the endpoint is attached to. Instead, the endpoint should be retrieved by calling [Sandbox.Endpoints()].
-func (n *Network) EndpointByID(id string) (*Endpoint, error) {
-	if id == "" {
-		return nil, ErrInvalidID(id)
-	}
-
-	ep, err := n.getEndpointFromStore(id)
-	if err != nil {
-		return nil, ErrNoSuchEndpoint(id)
-	}
-
-	return ep, nil
 }
 
 // updateSvcRecord adds or deletes local DNS records for a given Endpoint.
@@ -1515,18 +1533,21 @@ func (n *Network) ipamAllocate() (retErr error) {
 
 func (n *Network) ipamAllocateVersion(ipVer int, ipam ipamapi.Ipam) error {
 	var (
-		cfgList  *[]*IpamConf
-		infoList *[]*IpamInfo
-		err      error
+		cfgList     *[]*IpamConf
+		infoList    *[]*IpamInfo
+		skipGwAlloc bool
+		err         error
 	)
 
 	switch ipVer {
 	case 4:
 		cfgList = &n.ipamV4Config
 		infoList = &n.ipamV4Info
+		skipGwAlloc = n.skipGwAllocIPv4
 	case 6:
 		cfgList = &n.ipamV6Config
 		infoList = &n.ipamV6Info
+		skipGwAlloc = n.skipGwAllocIPv6
 	default:
 		return types.InternalErrorf("incorrect ip version passed to ipam allocate: %d", ipVer)
 	}
@@ -1577,16 +1598,19 @@ func (n *Network) ipamAllocateVersion(ipVer int, ipam ipamapi.Ipam) error {
 			}
 		}()
 
-		if gws, ok := d.Meta[netlabel.Gateway]; ok {
-			if d.Gateway, err = types.ParseCIDR(gws); err != nil {
-				return types.InvalidParameterErrorf("failed to parse gateway address (%v) returned by ipam driver: %v", gws, err)
+		// If there's no user-configured gateway address but the IPAM driver returned a gw when it
+		// set up the pool, use it. (It doesn't need to be requested/reserved in IPAM.)
+		if cfg.Gateway == "" {
+			if gws, ok := d.Meta[netlabel.Gateway]; ok {
+				if d.Gateway, err = types.ParseCIDR(gws); err != nil {
+					return types.InvalidParameterErrorf("failed to parse gateway address (%v) returned by ipam driver: %v", gws, err)
+				}
 			}
 		}
 
-		// If user requested a specific gateway, libnetwork will allocate it
-		// irrespective of whether ipam driver returned a gateway already.
-		// If none of the above is true, libnetwork will allocate one.
-		if cfg.Gateway != "" || d.Gateway == nil {
+		// If there's still no gateway, reserve cfg.Gateway if the user specified it. Else,
+		// if the driver wants a gateway, let the IPAM driver select an address.
+		if d.Gateway == nil && (cfg.Gateway != "" || !skipGwAlloc) {
 			gatewayOpts := map[string]string{
 				ipamapi.RequestAddressType: netlabel.Gateway,
 			}
@@ -1652,6 +1676,9 @@ func (n *Network) ipamReleaseVersion(ipVer int, ipam ipamapi.Ipam) {
 
 	for _, d := range *infoList {
 		if d.Gateway != nil {
+			// FIXME(robmry) - if an IPAM driver returned a gateway in Meta[netlabel.Gateway], and
+			// no user config overrode that address, it wasn't explicitly allocated so it shouldn't
+			// be released here?
 			if err := ipam.ReleaseAddress(d.PoolID, d.Gateway.IP); err != nil {
 				log.G(context.TODO()).Warnf("Failed to release gateway ip address %s on delete of network %s (%s): %v", d.Gateway.IP, n.Name(), n.ID(), err)
 			}

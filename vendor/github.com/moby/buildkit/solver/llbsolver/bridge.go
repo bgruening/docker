@@ -138,7 +138,7 @@ func (b *llbBridge) loadResult(ctx context.Context, def *pb.Definition, cacheImp
 	}
 	dpc := &detectPrunedCacheID{}
 
-	edge, err := Load(ctx, def, polEngine, dpc.Load, ValidateEntitlements(ent), WithCacheSources(cms), NormalizeRuntimePlatforms(), WithValidateCaps())
+	edge, err := Load(ctx, def, polEngine, dpc.Load, ValidateEntitlements(ent, w.CDIManager()), WithCacheSources(cms), NormalizeRuntimePlatforms(), WithValidateCaps())
 	if err != nil {
 		return nil, errors.Wrap(err, "failed to load LLB")
 	}
@@ -354,9 +354,9 @@ func (b *llbBridge) ResolveSourceMetadata(ctx context.Context, op *pb.SourceOp, 
 	}
 	id := op.Identifier
 	if opt.Platform != nil {
-		id += platforms.Format(*opt.Platform)
+		id += platforms.FormatAll(*opt.Platform)
 	} else {
-		id += platforms.Format(platforms.DefaultSpec())
+		id += platforms.FormatAll(platforms.DefaultSpec())
 	}
 	pol, err := loadSourcePolicy(b.builder)
 	if err != nil {

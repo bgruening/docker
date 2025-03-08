@@ -6,9 +6,9 @@ import (
 	"fmt"
 	"io"
 
-	"github.com/containerd/containerd/content"
-	c8dimages "github.com/containerd/containerd/images"
-	"github.com/containerd/containerd/leases"
+	"github.com/containerd/containerd/v2/core/content"
+	c8dimages "github.com/containerd/containerd/v2/core/images"
+	"github.com/containerd/containerd/v2/core/leases"
 	cerrdefs "github.com/containerd/errdefs"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
@@ -43,11 +43,6 @@ type manifestList struct {
 
 type manifest struct {
 	Config ocispec.Descriptor `json:"config"`
-}
-
-func (i *ImageService) PrepareSnapshot(ctx context.Context, id string, parentImage string, platform *ocispec.Platform, setupInit func(string) error) error {
-	// Only makes sense when containerd image store is used
-	panic("not implemented")
 }
 
 func (i *ImageService) manifestMatchesPlatform(ctx context.Context, img *image.Image, platform ocispec.Platform) (bool, error) {

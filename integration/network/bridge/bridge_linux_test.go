@@ -13,9 +13,14 @@ import (
 	"github.com/docker/docker/api/types/versions"
 	ctr "github.com/docker/docker/integration/internal/container"
 	"github.com/docker/docker/integration/internal/network"
+	"github.com/docker/docker/internal/nlwrap"
 	"github.com/docker/docker/internal/testutils/networking"
+	"github.com/docker/docker/libnetwork/drivers/bridge"
+	"github.com/docker/docker/libnetwork/netlabel"
 	"github.com/docker/docker/testutil"
 	"github.com/docker/docker/testutil/daemon"
+	"github.com/docker/go-connections/nat"
+	"github.com/vishvananda/netlink"
 	"gotest.tools/v3/assert"
 	is "gotest.tools/v3/assert/cmp"
 	"gotest.tools/v3/skip"
@@ -140,10 +145,9 @@ func TestIPRangeAt64BitLimit(t *testing.T) {
 	c := testEnv.APIClient()
 
 	tests := []struct {
-		name       string
-		subnet     string
-		ipRange    string
-		expCtrFail bool
+		name    string
+		subnet  string
+		ipRange string
 	}{
 		{
 			name:    "ipRange before end of 64-bit subnet",
@@ -154,22 +158,11 @@ func TestIPRangeAt64BitLimit(t *testing.T) {
 			name:    "ipRange at end of 64-bit subnet",
 			subnet:  "fda9:8d04:086e::/64",
 			ipRange: "fda9:8d04:086e::ffff:ffff:ffff:fffe/127",
-			// FIXME(robmry) - there should be two addresses available for
-			//  allocation, just like the previous test. One for the gateway
-			//  and one for the container. But, because the Bitmap in the
-			//  allocator can't cope with a range that includes MaxUint64,
-			//  only one address is currently available - so the container
-			//  will not start.
-			expCtrFail: true,
 		},
 		{
 			name:    "ipRange at 64-bit boundary inside 56-bit subnet",
 			subnet:  "fda9:8d04:086e::/56",
 			ipRange: "fda9:8d04:086e:aa:ffff:ffff:ffff:fffe/127",
-			// FIXME(robmry) - same issue as above, but this time the ip-range
-			//  is in the middle of the subnet (on a 64-bit boundary) rather
-			//  than at the top end.
-			expCtrFail: true,
 		},
 	}
 
@@ -186,12 +179,7 @@ func TestIPRangeAt64BitLimit(t *testing.T) {
 			id := ctr.Create(ctx, t, c, ctr.WithNetworkMode(netName))
 			defer c.ContainerRemove(ctx, id, containertypes.RemoveOptions{Force: true})
 			err := c.ContainerStart(ctx, id, containertypes.StartOptions{})
-			if tc.expCtrFail {
-				assert.Assert(t, err != nil)
-				t.Skipf("XFAIL Container startup failed with error: %v", err)
-			} else {
-				assert.NilError(t, err)
-			}
+			assert.NilError(t, err)
 		})
 	}
 }
@@ -314,4 +302,155 @@ func TestFilterForwardPolicy(t *testing.T) {
 			assert.Check(t, is.Equal(getSysctls(), sysctls{tc.expForwarding, tc.expForwarding, tc.expForwarding}))
 		})
 	}
+}
+
+// TestPointToPoint checks that a "/31" --internal network with inhibit_ipv4,
+// or gateway mode "isolated" has two addresses available for containers (no
+// address is reserved for a gateway, because it won't be used).
+func TestPointToPoint(t *testing.T) {
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
+
+	testcases := []struct {
+		name   string
+		netOpt func(*networktypes.CreateOptions)
+	}{
+		{
+			name:   "inhibit_ipv4",
+			netOpt: network.WithOption(bridge.InhibitIPv4, "true"),
+		},
+		{
+			name:   "isolated",
+			netOpt: network.WithOption(bridge.IPv4GatewayMode, "isolated"),
+		},
+	}
+
+	for _, tc := range testcases {
+		t.Run(tc.name, func(t *testing.T) {
+			ctx := testutil.StartSpan(ctx, t)
+
+			const netName = "testp2pbridge"
+			network.CreateNoError(ctx, t, apiClient, netName,
+				network.WithIPAM("192.168.135.0/31", ""),
+				network.WithInternal(),
+				tc.netOpt,
+			)
+			defer network.RemoveNoError(ctx, t, apiClient, netName)
+
+			const ctrName = "ctr1"
+			id := ctr.Run(ctx, t, apiClient,
+				ctr.WithNetworkMode(netName),
+				ctr.WithName(ctrName),
+			)
+			defer apiClient.ContainerRemove(ctx, id, containertypes.RemoveOptions{Force: true})
+
+			attachCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+			defer cancel()
+			res := ctr.RunAttach(attachCtx, t, apiClient,
+				ctr.WithCmd([]string{"ping", "-c1", "-W3", ctrName}...),
+				ctr.WithNetworkMode(netName),
+			)
+			defer apiClient.ContainerRemove(ctx, res.ContainerID, containertypes.RemoveOptions{Force: true})
+			assert.Check(t, is.Equal(res.ExitCode, 0))
+			assert.Check(t, is.Equal(res.Stderr.Len(), 0))
+			assert.Check(t, is.Contains(res.Stdout.String(), "1 packets transmitted, 1 packets received"))
+		})
+	}
+}
+
+// TestIsolated tests an internal network with gateway mode "isolated".
+func TestIsolated(t *testing.T) {
+	skip.If(t, testEnv.IsRootless, "can't inspect bridge addrs in rootless netns")
+
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
+
+	const netName = "testisol"
+	const bridgeName = "br-" + netName
+	network.CreateNoError(ctx, t, apiClient, netName,
+		network.WithIPv6(),
+		network.WithInternal(),
+		network.WithOption(bridge.IPv4GatewayMode, "isolated"),
+		network.WithOption(bridge.IPv6GatewayMode, "isolated"),
+		network.WithOption(bridge.BridgeName, bridgeName),
+	)
+	defer network.RemoveNoError(ctx, t, apiClient, netName)
+
+	// The bridge should not have any IP addresses.
+	link, err := nlwrap.LinkByName(bridgeName)
+	assert.NilError(t, err)
+	addrs, err := nlwrap.AddrList(link, netlink.FAMILY_ALL)
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(len(addrs), 0))
+
+	const ctrName = "ctr1"
+	id := ctr.Run(ctx, t, apiClient,
+		ctr.WithNetworkMode(netName),
+		ctr.WithName(ctrName),
+	)
+	defer apiClient.ContainerRemove(ctx, id, containertypes.RemoveOptions{Force: true})
+
+	ping := func(t *testing.T, ipv string) {
+		t.Helper()
+		attachCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		defer cancel()
+		res := ctr.RunAttach(attachCtx, t, apiClient,
+			ctr.WithCmd([]string{"ping", "-c1", "-W3", ipv, "ctr1"}...),
+			ctr.WithNetworkMode(netName),
+		)
+		defer apiClient.ContainerRemove(ctx, res.ContainerID, containertypes.RemoveOptions{Force: true})
+		assert.Check(t, is.Equal(res.ExitCode, 0))
+		assert.Check(t, is.Equal(res.Stderr.Len(), 0))
+		assert.Check(t, is.Contains(res.Stdout.String(), "1 packets transmitted, 1 packets received"))
+	}
+	ping(t, "-4")
+	ping(t, "-6")
+}
+
+func TestEndpointWithCustomIfname(t *testing.T) {
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
+
+	ctrID := ctr.Run(ctx, t, apiClient,
+		ctr.WithCmd("ip", "-o", "link", "show", "foobar"),
+		ctr.WithEndpointSettings("bridge", &networktypes.EndpointSettings{
+			DriverOpts: map[string]string{
+				netlabel.Ifname: "foobar",
+			},
+		}))
+	defer ctr.Remove(ctx, t, apiClient, ctrID, containertypes.RemoveOptions{Force: true})
+
+	out, err := ctr.Output(ctx, apiClient, ctrID)
+	assert.NilError(t, err)
+	assert.Assert(t, strings.Contains(out.Stdout, ": foobar@if"), "expected ': foobar@if' in 'ip link show':\n%s", out.Stdout)
+}
+
+// TestPublishedPortAlreadyInUse checks that a container that can't start
+// because of one its published port being already in use doesn't end up
+// triggering the restart loop.
+//
+// Regression test for: https://github.com/moby/moby/issues/49501
+func TestPublishedPortAlreadyInUse(t *testing.T) {
+	ctx := setupTest(t)
+	apiClient := testEnv.APIClient()
+
+	ctr1 := ctr.Run(ctx, t, apiClient,
+		ctr.WithCmd("top"),
+		ctr.WithExposedPorts("80/tcp"),
+		ctr.WithPortMap(nat.PortMap{"80/tcp": {{HostPort: "8000"}}}))
+	defer ctr.Remove(ctx, t, apiClient, ctr1, containertypes.RemoveOptions{Force: true})
+
+	ctr2 := ctr.Create(ctx, t, apiClient,
+		ctr.WithCmd("top"),
+		ctr.WithRestartPolicy(containertypes.RestartPolicyAlways),
+		ctr.WithExposedPorts("80/tcp"),
+		ctr.WithPortMap(nat.PortMap{"80/tcp": {{HostPort: "8000"}}}))
+	defer ctr.Remove(ctx, t, apiClient, ctr2, containertypes.RemoveOptions{Force: true})
+
+	err := apiClient.ContainerStart(ctx, ctr2, containertypes.StartOptions{})
+	assert.Assert(t, is.ErrorContains(err, "failed to set up container networking"))
+
+	inspect, err := apiClient.ContainerInspect(ctx, ctr2)
+	assert.NilError(t, err)
+	assert.Check(t, is.Equal(inspect.State.Status, "created"))
 }
