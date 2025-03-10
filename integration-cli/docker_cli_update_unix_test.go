@@ -186,7 +186,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateStats(c *testing.T) {
 		assert.NilError(c, err)
 		assert.Equal(c, resp.Header.Get("Content-Type"), "application/json")
 
-		var v *container.Stats
+		var v *container.StatsResponse
 		err = json.NewDecoder(body).Decode(&v)
 		assert.NilError(c, err)
 		body.Close()
@@ -232,7 +232,7 @@ func (s *DockerCLIUpdateSuite) TestUpdateNotAffectMonitorRestartPolicy(c *testin
 	assert.NilError(c, cmd.Start())
 	defer cmd.Process.Kill()
 
-	_, err = cpty.Write([]byte("exit\n"))
+	_, err = cpty.WriteString("exit\n")
 	assert.NilError(c, err)
 
 	assert.NilError(c, cmd.Wait())

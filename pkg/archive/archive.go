@@ -236,11 +236,9 @@ func (r *readCloserWrapper) Close() error {
 	return nil
 }
 
-var (
-	bufioReader32KPool = &sync.Pool{
-		New: func() interface{} { return bufio.NewReaderSize(nil, 32*1024) },
-	}
-)
+var bufioReader32KPool = &sync.Pool{
+	New: func() interface{} { return bufio.NewReaderSize(nil, 32*1024) },
+}
 
 type bufferedReader struct {
 	buf *bufio.Reader
@@ -252,17 +250,17 @@ func newBufferedReader(r io.Reader) *bufferedReader {
 	return &bufferedReader{buf}
 }
 
-func (r *bufferedReader) Read(p []byte) (n int, err error) {
+func (r *bufferedReader) Read(p []byte) (int, error) {
 	if r.buf == nil {
 		return 0, io.EOF
 	}
-	n, err = r.buf.Read(p)
+	n, err := r.buf.Read(p)
 	if err == io.EOF {
 		r.buf.Reset(nil)
 		bufioReader32KPool.Put(r.buf)
 		r.buf = nil
 	}
-	return
+	return n, err
 }
 
 func (r *bufferedReader) Peek(n int) ([]byte, error) {
@@ -428,7 +426,7 @@ func ReplaceFileTarWrapper(inputTarStream io.ReadCloser, mods map[string]TarModi
 					pipeWriter.CloseWithError(err)
 					return
 				}
-				if _, err := copyWithBuffer(tarWriter, tarReader); err != nil {
+				if err := copyWithBuffer(tarWriter, tarReader); err != nil {
 					pipeWriter.CloseWithError(err)
 					return
 				}
@@ -472,11 +470,33 @@ func (compression *Compression) Extension() string {
 	return ""
 }
 
+// assert that we implement [tar.FileInfoNames].
+//
+// TODO(thaJeztah): disabled to allow compiling on < go1.23. un-comment once we drop support for older versions of go.
+// var _ tar.FileInfoNames = (*nosysFileInfo)(nil)
+
 // nosysFileInfo hides the system-dependent info of the wrapped FileInfo to
 // prevent tar.FileInfoHeader from introspecting it and potentially calling into
 // glibc.
+//
+// It implements [tar.FileInfoNames] to further prevent [tar.FileInfoHeader]
+// from performing any lookups on go1.23 and up. see https://go.dev/issue/50102
 type nosysFileInfo struct {
 	os.FileInfo
+}
+
+// Uname stubs out looking up username. It implements [tar.FileInfoNames]
+// to prevent [tar.FileInfoHeader] from loading libraries to perform
+// username lookups.
+func (fi nosysFileInfo) Uname() (string, error) {
+	return "", nil
+}
+
+// Gname stubs out looking up group-name. It implements [tar.FileInfoNames]
+// to prevent [tar.FileInfoHeader] from loading libraries to perform
+// username lookups.
+func (fi nosysFileInfo) Gname() (string, error) {
+	return "", nil
 }
 
 func (fi nosysFileInfo) Sys() interface{} {
@@ -709,7 +729,7 @@ func (ta *tarAppender) addTarFile(path, name string) error {
 			return err
 		}
 
-		_, err = copyWithBuffer(ta.TarWriter, file)
+		err = copyWithBuffer(ta.TarWriter, file)
 		file.Close()
 		if err != nil {
 			return err
@@ -756,11 +776,11 @@ func createTarFile(path, extractDir string, hdr *tar.Header, reader io.Reader, o
 		if err != nil {
 			return err
 		}
-		if _, err := copyWithBuffer(file, reader); err != nil {
-			file.Close()
+		if err := copyWithBuffer(file, reader); err != nil {
+			_ = file.Close()
 			return err
 		}
-		file.Close()
+		_ = file.Close()
 
 	case tar.TypeBlock, tar.TypeChar:
 		if inUserns { // cannot create devices in a userns
@@ -1416,7 +1436,7 @@ func (archiver *Archiver) CopyFileWithTar(src, dst string) (err error) {
 			if err := tw.WriteHeader(hdr); err != nil {
 				return err
 			}
-			if _, err := copyWithBuffer(tw, srcF); err != nil {
+			if err := copyWithBuffer(tw, srcF); err != nil {
 				return err
 			}
 			return nil

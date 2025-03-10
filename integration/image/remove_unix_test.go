@@ -47,12 +47,11 @@ func TestRemoveImageGarbageCollector(t *testing.T) {
 	client := d.NewClientT(t)
 
 	layerStore, _ := layer.NewStoreFromOptions(layer.StoreOptions{
-		Root:                      d.Root,
-		MetadataStorePathTemplate: filepath.Join(d.RootDir(), "image", "%s", "layerdb"),
-		GraphDriver:               d.StorageDriver(),
-		GraphDriverOptions:        nil,
-		IDMapping:                 idtools.IdentityMapping{},
-		ExperimentalEnabled:       false,
+		Root:                d.Root,
+		GraphDriver:         d.StorageDriver(),
+		GraphDriverOptions:  nil,
+		IDMapping:           idtools.IdentityMapping{},
+		ExperimentalEnabled: false,
 	})
 	i := images.NewImageService(images.ImageServiceConfig{
 		LayerStore: layerStore,
@@ -76,7 +75,7 @@ func TestRemoveImageGarbageCollector(t *testing.T) {
 	_, err = io.Copy(io.Discard, resp.Body)
 	resp.Body.Close()
 	assert.NilError(t, err)
-	img, _, err := client.ImageInspectWithRaw(ctx, imgName)
+	img, err := client.ImageInspect(ctx, imgName)
 	assert.NilError(t, err)
 
 	// Mark latest image layer to immutable

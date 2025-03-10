@@ -2,16 +2,18 @@ package buildkit
 
 import (
 	"context"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"time"
 
-	ctd "github.com/containerd/containerd"
-	"github.com/containerd/containerd/content/local"
-	ctdmetadata "github.com/containerd/containerd/metadata"
-	"github.com/containerd/containerd/snapshots"
+	ctd "github.com/containerd/containerd/v2/client"
+	ctdmetadata "github.com/containerd/containerd/v2/core/metadata"
+	"github.com/containerd/containerd/v2/core/snapshots"
+	"github.com/containerd/containerd/v2/plugins/content/local"
 	"github.com/containerd/log"
 	"github.com/containerd/platforms"
 	"github.com/docker/docker/api/types"
@@ -43,6 +45,7 @@ import (
 	containerdsnapshot "github.com/moby/buildkit/snapshot/containerd"
 	"github.com/moby/buildkit/solver"
 	"github.com/moby/buildkit/solver/bboltcachestorage"
+	"github.com/moby/buildkit/solver/llbsolver/cdidevices"
 	"github.com/moby/buildkit/solver/pb"
 	"github.com/moby/buildkit/util/apicaps"
 	"github.com/moby/buildkit/util/archutil"
@@ -57,6 +60,7 @@ import (
 	"go.etcd.io/bbolt"
 	bolt "go.etcd.io/bbolt"
 	"go.opentelemetry.io/otel/sdk/trace"
+	"tags.cncf.io/container-device-interface/pkg/cdi"
 )
 
 func newController(ctx context.Context, rt http.RoundTripper, opt Opt) (*control.Controller, error) {
@@ -108,6 +112,11 @@ func newSnapshotterController(ctx context.Context, rt http.RoundTripper, opt Opt
 
 	dns := getDNSConfig(opt.DNSConfig)
 
+	cdiManager, err := getCDIManager(opt.CDISpecDirs)
+	if err != nil {
+		return nil, err
+	}
+
 	workerOpts := containerd.WorkerOptions{
 		Root:            opt.Root,
 		Address:         opt.ContainerdAddress,
@@ -121,6 +130,7 @@ func newSnapshotterController(ctx context.Context, rt http.RoundTripper, opt Opt
 		NetworkOpt:      nc,
 		ApparmorProfile: opt.ApparmorProfile,
 		Selinux:         false,
+		CDIManager:      cdiManager,
 	}
 
 	wo, err := containerd.NewWorkerOpt(workerOpts, ctd.WithTimeout(60*time.Second))
@@ -142,13 +152,13 @@ func newSnapshotterController(ctx context.Context, rt http.RoundTripper, opt Opt
 	wo.RegistryHosts = opt.RegistryHosts
 	wo.Labels = getLabels(opt, wo.Labels)
 
-	exec, err := newExecutor(opt.Root, opt.DefaultCgroupParent, opt.NetworkController, dns, opt.Rootless, opt.IdentityMapping, opt.ApparmorProfile)
+	exec, err := newExecutor(opt.Root, opt.DefaultCgroupParent, opt.NetworkController, dns, opt.Rootless, opt.IdentityMapping, opt.ApparmorProfile, cdiManager)
 	if err != nil {
 		return nil, err
 	}
 	wo.Executor = exec
 
-	w, err := mobyworker.NewContainerdWorker(ctx, wo, opt.Callbacks)
+	w, err := mobyworker.NewContainerdWorker(ctx, wo, opt.Callbacks, rt)
 	if err != nil {
 		return nil, err
 	}
@@ -316,7 +326,12 @@ func newGraphDriverController(ctx context.Context, rt http.RoundTripper, opt Opt
 
 	dns := getDNSConfig(opt.DNSConfig)
 
-	exec, err := newExecutor(root, opt.DefaultCgroupParent, opt.NetworkController, dns, opt.Rootless, opt.IdentityMapping, opt.ApparmorProfile)
+	cdiManager, err := getCDIManager(opt.CDISpecDirs)
+	if err != nil {
+		return nil, err
+	}
+
+	exec, err := newExecutor(root, opt.DefaultCgroupParent, opt.NetworkController, dns, opt.Rootless, opt.IdentityMapping, opt.ApparmorProfile, cdiManager)
 	if err != nil {
 		return nil, err
 	}
@@ -384,6 +399,7 @@ func newGraphDriverController(ctx context.Context, rt http.RoundTripper, opt Opt
 		LeaseManager:      lm,
 		GarbageCollect:    mdb.GarbageCollect,
 		Labels:            getLabels(opt, nil),
+		CDIManager:        cdiManager,
 	}
 
 	wc := &worker.Controller{}
@@ -430,37 +446,29 @@ func getGCPolicy(conf config.BuilderConfig, root string) ([]client.PruneInfo, er
 	var gcPolicy []client.PruneInfo
 	if conf.GC.Enabled {
 		if conf.GC.Policy == nil {
-			var defaultKeepStorage int64
-			if conf.GC.DefaultKeepStorage != "" {
-				b, err := units.RAMInBytes(conf.GC.DefaultKeepStorage)
-				if err != nil {
-					return nil, errors.Wrapf(err, "failed to parse defaultKeepStorage")
-				}
-				defaultKeepStorage = b
+			reservedSpace, maxUsedSpace, minFreeSpace, err := parseGCPolicy(config.BuilderGCRule{
+				ReservedSpace: conf.GC.DefaultReservedSpace,
+				MaxUsedSpace:  conf.GC.DefaultMaxUsedSpace,
+				MinFreeSpace:  conf.GC.DefaultMinFreeSpace,
+			}, "default")
+			if err != nil {
+				return nil, err
 			}
-			gcPolicy = mobyworker.DefaultGCPolicy(root, defaultKeepStorage)
+			gcPolicy = mobyworker.DefaultGCPolicy(root, reservedSpace, maxUsedSpace, minFreeSpace)
 		} else {
 			gcPolicy = make([]client.PruneInfo, len(conf.GC.Policy))
 			for i, p := range conf.GC.Policy {
-				var keepStorage int64
-				if p.KeepStorage != "" {
-					b, err := units.RAMInBytes(p.KeepStorage)
-					if err != nil {
-						return nil, errors.Wrapf(err, "failed to parse keepStorage")
-					}
-					// don't set a default here, zero is a valid value when
-					// specified by the user, as the gc-policy may be determined
-					// through other filters;
-					// https://github.com/moby/moby/pull/49062#issuecomment-2554981829
-					keepStorage = b
+				reservedSpace, maxUsedSpace, minFreeSpace, err := parseGCPolicy(p, "")
+				if err != nil {
+					return nil, err
 				}
 
-				// FIXME(thaJeztah): wire up new options https://github.com/moby/moby/issues/48639
-				var err error
 				gcPolicy[i], err = toBuildkitPruneInfo(types.BuildCachePruneOptions{
-					All:         p.All,
-					KeepStorage: keepStorage,
-					Filters:     filters.Args(p.Filter),
+					All:           p.All,
+					ReservedSpace: reservedSpace,
+					MaxUsedSpace:  maxUsedSpace,
+					MinFreeSpace:  minFreeSpace,
+					Filters:       filters.Args(p.Filter),
 				})
 				if err != nil {
 					return nil, err
@@ -469,6 +477,41 @@ func getGCPolicy(conf config.BuilderConfig, root string) ([]client.PruneInfo, er
 		}
 	}
 	return gcPolicy, nil
+}
+
+func parseGCPolicy(p config.BuilderGCRule, prefix string) (reservedSpace, maxUsedSpace, minFreeSpace int64, err error) {
+	errorString := func(key string) string {
+		if prefix != "" {
+			key = prefix + strings.ToTitle(key)
+		}
+		return fmt.Sprintf("failed to parse %s", key)
+	}
+
+	if p.ReservedSpace != "" {
+		b, err := units.RAMInBytes(p.ReservedSpace)
+		if err != nil {
+			return 0, 0, 0, errors.Wrap(err, errorString("reservedSpace"))
+		}
+		reservedSpace = b
+	}
+
+	if p.MaxUsedSpace != "" {
+		b, err := units.RAMInBytes(p.MaxUsedSpace)
+		if err != nil {
+			return 0, 0, 0, errors.Wrap(err, errorString("maxUsedSpace"))
+		}
+		maxUsedSpace = b
+	}
+
+	if p.MinFreeSpace != "" {
+		b, err := units.RAMInBytes(p.MinFreeSpace)
+		if err != nil {
+			return 0, 0, 0, errors.Wrap(err, errorString("minFreeSpace"))
+		}
+		minFreeSpace = b
+	}
+
+	return reservedSpace, maxUsedSpace, minFreeSpace, nil
 }
 
 func getEntitlements(conf config.BuilderConfig) []string {
@@ -499,4 +542,32 @@ func getLabels(opt Opt, labels map[string]string) map[string]string {
 		}
 	}
 	return labels
+}
+
+func getCDIManager(specDirs []string) (*cdidevices.Manager, error) {
+	if len(specDirs) == 0 {
+		return nil, nil
+	}
+	cdiCache, err := func() (*cdi.Cache, error) {
+		cdiCache, err := cdi.NewCache(cdi.WithSpecDirs(specDirs...))
+		if err != nil {
+			return nil, err
+		}
+		if err := cdiCache.Refresh(); err != nil {
+			return nil, err
+		}
+		if errs := cdiCache.GetErrors(); len(errs) > 0 {
+			for dir, errs := range errs {
+				for _, err := range errs {
+					log.L.Warnf("CDI setup error %v: %+v", dir, err)
+				}
+			}
+		}
+		return cdiCache, nil
+	}()
+	if err != nil {
+		return nil, errors.Wrapf(err, "CDI registry initialization failure")
+	}
+	// TODO: add support for auto-allowed devices from config
+	return cdidevices.NewManager(cdiCache, nil), nil
 }

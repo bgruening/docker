@@ -310,7 +310,7 @@ func (daemon *Daemon) createNetwork(cfg *config.Config, create networktypes.Crea
 		}
 	}
 
-	enableIPv4 := create.ConfigFrom == nil
+	enableIPv4 := true
 	if create.EnableIPv4 != nil {
 		enableIPv4 = *create.EnableIPv4
 	} else if v, ok := networkOptions[netlabel.EnableIPv4]; ok {
@@ -318,11 +318,6 @@ func (daemon *Daemon) createNetwork(cfg *config.Config, create networktypes.Crea
 		if enableIPv4, err = strconv.ParseBool(v); err != nil {
 			return nil, errdefs.InvalidParameter(fmt.Errorf("driver-opt %q is not a valid bool", netlabel.EnableIPv4))
 		}
-	}
-	if !enableIPv4 && !daemon.config().Experimental && create.ConfigFrom == nil {
-		return nil, errdefs.InvalidParameter(
-			errors.New("IPv4 can only be disabled if experimental features are enabled"),
-		)
 	}
 
 	var enableIPv6 bool
@@ -756,9 +751,13 @@ func buildIPAMResources(nw *libnetwork.Network) networktypes.IPAM {
 				if info.IPAMData.Pool == nil {
 					continue
 				}
+				var gw string
+				if info.IPAMData.Gateway != nil {
+					gw = info.IPAMData.Gateway.IP.String()
+				}
 				ipamConfig = append(ipamConfig, networktypes.IPAMConfig{
 					Subnet:  info.IPAMData.Pool.String(),
-					Gateway: info.IPAMData.Gateway.String(),
+					Gateway: gw,
 				})
 			}
 		}
@@ -915,6 +914,10 @@ func buildCreateEndpointOptions(c *container.Container, n *libnetwork.Network, e
 		if sbIPv6, ok := sb.IPv6Enabled(); ok && !sbIPv6 {
 			createOptions = append(createOptions, libnetwork.CreateOptionDisableIPv6())
 		}
+	}
+
+	if path, ok := sb.NetnsPath(); ok {
+		createOptions = append(createOptions, libnetwork.WithNetnsPath(path))
 	}
 
 	return createOptions, nil

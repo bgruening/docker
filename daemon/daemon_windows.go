@@ -25,7 +25,6 @@ import (
 	"github.com/docker/docker/libnetwork/options"
 	"github.com/docker/docker/libnetwork/scope"
 	"github.com/docker/docker/pkg/idtools"
-	"github.com/docker/docker/pkg/parsers"
 	"github.com/docker/docker/pkg/parsers/operatingsystem"
 	"github.com/docker/docker/pkg/sysinfo"
 	"github.com/docker/docker/pkg/system"
@@ -110,7 +109,7 @@ func verifyPlatformContainerResources(resources *containertypes.Resources, isHyp
 	// The precision we could get is 0.01, because on Windows we have to convert to CPUPercent.
 	// We don't set the lower limit here and it is up to the underlying platform (e.g., Windows) to return an error.
 	if resources.NanoCPUs != 0 {
-		nc := sysinfo.NumCPU()
+		nc := runtime.NumCPU()
 		if resources.NanoCPUs < 0 || resources.NanoCPUs > int64(nc)*1e9 {
 			return warnings, fmt.Errorf("range of CPUs is from 0.01 to %[1]d.00, as there are only %[1]d CPUs available", nc)
 		}
@@ -229,7 +228,7 @@ func configureKernelSecuritySupport(config *config.Config, driverName string) er
 }
 
 // configureMaxThreads sets the Go runtime max threads threshold
-func configureMaxThreads(config *config.Config) error {
+func configureMaxThreads(_ context.Context) error {
 	return nil
 }
 
@@ -523,26 +522,20 @@ func (daemon *Daemon) setDefaultIsolation(config *config.Config) error {
 	} else {
 		daemon.defaultIsolation = containertypes.IsolationProcess
 	}
-	for _, option := range config.ExecOptions {
-		key, val, err := parsers.ParseKeyValueOpt(option)
-		if err != nil {
-			return err
+	val, ok, err := config.GetExecOpt("isolation")
+	if err != nil {
+		return err
+	}
+	if ok {
+		isolation := containertypes.Isolation(strings.ToLower(val))
+		if !isolation.IsValid() {
+			return fmt.Errorf("invalid exec-opt value for 'isolation':'%s'", val)
 		}
-		key = strings.ToLower(key)
-		switch key {
-
-		case "isolation":
-			if !containertypes.Isolation(val).IsValid() {
-				return fmt.Errorf("Invalid exec-opt value for 'isolation':'%s'", val)
-			}
-			if containertypes.Isolation(val).IsHyperV() {
-				daemon.defaultIsolation = containertypes.IsolationHyperV
-			}
-			if containertypes.Isolation(val).IsProcess() {
-				daemon.defaultIsolation = containertypes.IsolationProcess
-			}
-		default:
-			return fmt.Errorf("Unrecognised exec-opt '%s'\n", key)
+		if isolation.IsHyperV() {
+			daemon.defaultIsolation = containertypes.IsolationHyperV
+		}
+		if isolation.IsProcess() {
+			daemon.defaultIsolation = containertypes.IsolationProcess
 		}
 	}
 
@@ -574,13 +567,7 @@ func (daemon *Daemon) initLibcontainerd(ctx context.Context, cfg *config.Config)
 
 	switch rt {
 	case config.WindowsV1RuntimeName:
-		daemon.containerd, err = local.NewClient(
-			ctx,
-			daemon.containerdClient,
-			filepath.Join(cfg.ExecRoot, "containerd"),
-			cfg.ContainerdNamespace,
-			daemon,
-		)
+		daemon.containerd, err = local.NewClient(ctx, daemon)
 	case config.WindowsV2RuntimeName:
 		if cfg.ContainerdAddr == "" {
 			return fmt.Errorf("cannot use the specified runtime %q without containerd", rt)
