@@ -445,7 +445,7 @@ func (d *driver) DeleteNetwork(nid string) error {
 
 	if n.created {
 		_, err = hcsshim.HNSNetworkRequest("DELETE", config.HnsID, "")
-		if err != nil && err.Error() != errNotFound {
+		if err != nil && !strings.EqualFold(err.Error(), errNotFound) {
 			return types.ForbiddenErrorf("%v", err)
 		}
 	}
@@ -794,7 +794,7 @@ func (d *driver) DeleteEndpoint(nid, eid string) error {
 	n.Unlock()
 
 	_, err = hcsshim.HNSEndpointRequest("DELETE", ep.profileID, "")
-	if err != nil && err.Error() != errNotFound {
+	if err != nil && !strings.EqualFold(err.Error(), errNotFound) {
 		return err
 	}
 
@@ -846,7 +846,7 @@ func (d *driver) EndpointOperInfo(nid, eid string) (map[string]interface{}, erro
 }
 
 // Join method is invoked when a Sandbox is attached to an endpoint.
-func (d *driver) Join(ctx context.Context, nid, eid string, sboxKey string, jinfo driverapi.JoinInfo, options map[string]interface{}) error {
+func (d *driver) Join(ctx context.Context, nid, eid string, sboxKey string, jinfo driverapi.JoinInfo, _, options map[string]interface{}) error {
 	ctx, span := otel.Tracer("").Start(ctx, fmt.Sprintf("libnetwork.drivers.windows_%s.Join", d.name), trace.WithAttributes(
 		attribute.String("nid", nid),
 		attribute.String("eid", eid),

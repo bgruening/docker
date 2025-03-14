@@ -17,7 +17,10 @@ import (
 
 // DockerChain: DOCKER iptable chain name
 const (
-	DockerChain = "DOCKER"
+	DockerChain        = "DOCKER"
+	DockerForwardChain = "DOCKER-FORWARD"
+	DockerBridgeChain  = "DOCKER-BRIDGE"
+	DockerCTChain      = "DOCKER-CT"
 
 	// Isolation between bridge networks is achieved in two stages by means
 	// of the following two chains in the filter table. The first chain matches
@@ -31,11 +34,6 @@ const (
 
 	IsolationChain1 = "DOCKER-ISOLATION-STAGE-1"
 	IsolationChain2 = "DOCKER-ISOLATION-STAGE-2"
-
-	// ipset names for IPv4 and IPv6 bridge subnets that don't belong
-	// to --internal networks.
-	ipsetExtBridges4 = "docker-ext-bridges-v4"
-	ipsetExtBridges6 = "docker-ext-bridges-v6"
 )
 
 // Path to the executable installed in Linux under WSL2 that reports on
@@ -78,6 +76,42 @@ func setupIPChains(config configuration, version iptables.IPVersion) (retErr err
 		}
 	}()
 
+	_, err = iptable.NewChain(DockerForwardChain, iptables.Filter)
+	if err != nil {
+		return fmt.Errorf("failed to create FILTER chain %s: %v", DockerForwardChain, err)
+	}
+	defer func() {
+		if retErr != nil {
+			if err := iptable.RemoveExistingChain(DockerForwardChain, iptables.Filter); err != nil {
+				log.G(context.TODO()).Warnf("failed on removing iptables FILTER chain %s on cleanup: %v", DockerForwardChain, err)
+			}
+		}
+	}()
+
+	_, err = iptable.NewChain(DockerBridgeChain, iptables.Filter)
+	if err != nil {
+		return fmt.Errorf("failed to create FILTER chain %s: %v", DockerBridgeChain, err)
+	}
+	defer func() {
+		if retErr != nil {
+			if err := iptable.RemoveExistingChain(DockerBridgeChain, iptables.Filter); err != nil {
+				log.G(context.TODO()).Warnf("failed on removing iptables FILTER chain %s on cleanup: %v", DockerBridgeChain, err)
+			}
+		}
+	}()
+
+	_, err = iptable.NewChain(DockerCTChain, iptables.Filter)
+	if err != nil {
+		return fmt.Errorf("failed to create FILTER chain %s: %v", DockerCTChain, err)
+	}
+	defer func() {
+		if retErr != nil {
+			if err := iptable.RemoveExistingChain(DockerCTChain, iptables.Filter); err != nil {
+				log.G(context.TODO()).Warnf("failed on removing iptables FILTER chain %s on cleanup: %v", DockerCTChain, err)
+			}
+		}
+	}()
+
 	_, err = iptable.NewChain(IsolationChain1, iptables.Filter)
 	if err != nil {
 		return fmt.Errorf("failed to create FILTER isolation chain: %v", err)
@@ -116,26 +150,42 @@ func setupIPChains(config configuration, version iptables.IPVersion) (retErr err
 	// Make sure the filter-FORWARD chain has rules to accept related packets and
 	// jump to the isolation and docker chains. (Re-)insert at the top of the table,
 	// in reverse order.
-	ipsetName := ipsetExtBridges4
-	if version == iptables.IPv6 {
-		ipsetName = ipsetExtBridges6
-	}
-	if err := iptable.EnsureJumpRule("FORWARD", DockerChain,
-		"-m", "set", "--match-set", ipsetName, "dst"); err != nil {
+	if err := iptable.EnsureJumpRule("FORWARD", DockerForwardChain); err != nil {
 		return err
 	}
-	if err := iptable.EnsureJumpRule("FORWARD", IsolationChain1); err != nil {
+	if err := iptable.EnsureJumpRule(DockerForwardChain, DockerBridgeChain); err != nil {
 		return err
 	}
-	if err := iptable.EnsureJumpRule("FORWARD", "ACCEPT",
-		"-m", "set", "--match-set", ipsetName, "dst",
-		"-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED",
-	); err != nil {
+	if err := iptable.EnsureJumpRule(DockerForwardChain, IsolationChain1); err != nil {
+		return err
+	}
+	if err := iptable.EnsureJumpRule(DockerForwardChain, DockerCTChain); err != nil {
 		return err
 	}
 
 	if err := mirroredWSL2Workaround(config, version); err != nil {
 		return err
+	}
+
+	// Delete rules that may have been added to the FORWARD chain by moby 28.0.0.
+	ipsetName := "docker-ext-bridges-v4"
+	if version == iptables.IPv6 {
+		ipsetName = "docker-ext-bridges-v6"
+	}
+	if err := iptable.DeleteJumpRule("FORWARD", DockerChain,
+		"-m", "set", "--match-set", ipsetName, "dst"); err != nil {
+		log.G(context.TODO()).WithFields(log.Fields{"error": err, "set": ipsetName}).Debug(
+			"deleting legacy ipset dest match rule")
+	}
+	if err := iptable.DeleteJumpRule("FORWARD", IsolationChain1); err != nil {
+		return err
+	}
+	if err := iptable.DeleteJumpRule("FORWARD", "ACCEPT",
+		"-m", "set", "--match-set", ipsetName, "dst",
+		"-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED",
+	); err != nil {
+		log.G(context.TODO()).WithFields(log.Fields{"error": err, "set": ipsetName}).Debug(
+			"deleting legacy ipset conntrack rule")
 	}
 
 	return nil
@@ -189,11 +239,6 @@ func (n *bridgeNetwork) setupIPTables(ipVersion iptables.IPVersion, maskedAddr *
 	// Pickup this configuration option from driver
 	hairpinMode := !driverConfig.EnableUserlandProxy
 
-	ipsetName := ipsetExtBridges4
-	if ipVersion == iptables.IPv6 {
-		ipsetName = ipsetExtBridges6
-	}
-
 	if config.Internal {
 		if err = setupInternalNetworkRules(config.BridgeName, maskedAddr, config.EnableICC, true); err != nil {
 			return fmt.Errorf("Failed to Setup IP tables: %w", err)
@@ -228,20 +273,26 @@ func (n *bridgeNetwork) setupIPTables(ipVersion iptables.IPVersion, maskedAddr *
 			return err
 		}
 
-		cidr, _ := maskedAddr.Mask.Size()
-		if cidr == 0 {
-			return fmt.Errorf("no CIDR for bridge %s addr %s", config.BridgeName, maskedAddr)
-		}
-		ipsetEntry := &netlink.IPSetEntry{
-			IP:   maskedAddr.IP,
-			CIDR: uint8(cidr),
-		}
-		if err := netlink.IpsetAdd(ipsetName, ipsetEntry); err != nil {
-			return fmt.Errorf("failed to add bridge %s (%s) to ipset: %w",
-				config.BridgeName, maskedAddr, err)
+		ctRule := iptables.Rule{IPVer: ipVersion, Table: iptables.Filter, Chain: DockerCTChain, Args: []string{
+			"-o", config.BridgeName,
+			"-m", "conntrack", "--ctstate", "RELATED,ESTABLISHED",
+			"-j", "ACCEPT",
+		}}
+		if err := appendOrDelChainRule(ctRule, "bridge ct related", true); err != nil {
+			return err
 		}
 		n.registerIptCleanFunc(func() error {
-			return netlink.IpsetDel(ipsetName, ipsetEntry)
+			return appendOrDelChainRule(ctRule, "bridge ct related", false)
+		})
+		jumpToDockerRule := iptables.Rule{IPVer: ipVersion, Table: iptables.Filter, Chain: DockerBridgeChain, Args: []string{
+			"-o", config.BridgeName,
+			"-j", DockerChain,
+		}}
+		if err := appendOrDelChainRule(jumpToDockerRule, "jump to docker", true); err != nil {
+			return err
+		}
+		n.registerIptCleanFunc(func() error {
+			return appendOrDelChainRule(jumpToDockerRule, "jump to docker", false)
 		})
 	}
 	return nil
@@ -406,18 +457,31 @@ func setupNonInternalNetworkRules(ipVer iptables.IPVersion, config *networkConfi
 	hpNatRule := iptables.Rule{IPVer: ipVer, Table: iptables.Nat, Chain: "POSTROUTING", Args: hpNatArgs}
 
 	// Set NAT.
-	if nat && config.EnableIPMasquerade {
-		if err := programChainRule(natRule, "NAT", enable); err != nil {
-			return err
+	if config.EnableIPMasquerade {
+		if nat {
+			if err := programChainRule(natRule, "NAT", enable); err != nil {
+				return err
+			}
 		}
-	}
-	if !nat || (config.EnableIPMasquerade && !hairpin) {
-		skipDNAT := iptables.Rule{IPVer: ipVer, Table: iptables.Nat, Chain: DockerChain, Args: []string{
-			"-i", config.BridgeName,
-			"-j", "RETURN",
-		}}
-		if err := programChainRule(skipDNAT, "SKIP DNAT", enable); err != nil {
-			return err
+		// If the userland proxy is running (!hairpin), skip DNAT for packets originating from
+		// this new network. Then, the proxy can pick up the packet from the host address the dest
+		// port is published to. Otherwise, if the packet is DNAT'd, it's forwarded straight to the
+		// target network, and will be dropped by network isolation rules if it didn't originate in
+		// the same bridge network. (So, with the proxy enabled, this skip allows a container in one
+		// network to reach a port published by a container in another bridge network.)
+		//
+		// If the userland proxy is disabled, don't skip, so packets will be DNAT'd. That will
+		// enable access to ports published by containers in the same network. But, the INC rules
+		// will block access to that published port from containers in other networks. (However,
+		// users may add a rule to DOCKER-USER to work around the INC rules if needed.)
+		if !hairpin {
+			skipDNAT := iptables.Rule{IPVer: ipVer, Table: iptables.Nat, Chain: DockerChain, Args: []string{
+				"-i", config.BridgeName,
+				"-j", "RETURN",
+			}}
+			if err := programChainRule(skipDNAT, "SKIP DNAT", enable); err != nil {
+				return err
+			}
 		}
 	}
 
@@ -443,24 +507,31 @@ func setupNonInternalNetworkRules(ipVer iptables.IPVersion, config *networkConfi
 	// to ACCEPT packets that weren't ICC - an extra rule was needed to enable
 	// ICC if needed. Those rules are now combined. So, outRuleNoICC is only
 	// needed for ICC=false, along with the DROP rule for ICC added by setIcc.
-	outRuleNoICC := iptables.Rule{IPVer: ipVer, Table: iptables.Filter, Chain: "FORWARD", Args: []string{
+	outRuleNoICC := iptables.Rule{IPVer: ipVer, Table: iptables.Filter, Chain: DockerForwardChain, Args: []string{
 		"-i", config.BridgeName,
 		"!", "-o", config.BridgeName,
 		"-j", "ACCEPT",
 	}}
-	if config.EnableICC {
-		// Remove the legacy rule for ICC (which didn't accept outgoing traffic), if one has been
-		// left behind by an old daemon.
-		if err := outRuleNoICC.Delete(); err != nil {
-			return err
+	// If there's a version of outRuleNoICC in the FORWARD chain, created by moby 28.0.0 or older, delete it.
+	if enable {
+		if err := outRuleNoICC.WithChain("FORWARD").Delete(); err != nil {
+			return fmt.Errorf("deleting FORWARD chain outRuleNoICC: %w", err)
 		}
+	}
+	if config.EnableICC {
 		// Accept outgoing traffic to anywhere, including other containers on this bridge.
-		outRuleICC := iptables.Rule{IPVer: ipVer, Table: iptables.Filter, Chain: "FORWARD", Args: []string{
+		outRuleICC := iptables.Rule{IPVer: ipVer, Table: iptables.Filter, Chain: DockerForwardChain, Args: []string{
 			"-i", config.BridgeName,
 			"-j", "ACCEPT",
 		}}
 		if err := appendOrDelChainRule(outRuleICC, "ACCEPT OUTGOING", enable); err != nil {
 			return err
+		}
+		// If there's a version of outRuleICC in the FORWARD chain, created by moby 28.0.0 or older, delete it.
+		if enable {
+			if err := outRuleICC.WithChain("FORWARD").Delete(); err != nil {
+				return fmt.Errorf("deleting FORWARD chain outRuleICC: %w", err)
+			}
 		}
 	} else {
 		// Accept outgoing traffic to anywhere, apart from other containers on this bridge.
@@ -501,8 +572,8 @@ func appendOrDelChainRule(rule iptables.Rule, ruleDescr string, append bool) err
 
 func setIcc(version iptables.IPVersion, bridgeIface string, iccEnable, internal, insert bool) error {
 	args := []string{"-i", bridgeIface, "-o", bridgeIface, "-j"}
-	acceptRule := iptables.Rule{IPVer: version, Table: iptables.Filter, Chain: "FORWARD", Args: append(args, "ACCEPT")}
-	dropRule := iptables.Rule{IPVer: version, Table: iptables.Filter, Chain: "FORWARD", Args: append(args, "DROP")}
+	acceptRule := iptables.Rule{IPVer: version, Table: iptables.Filter, Chain: DockerForwardChain, Args: append(args, "ACCEPT")}
+	dropRule := iptables.Rule{IPVer: version, Table: iptables.Filter, Chain: DockerForwardChain, Args: append(args, "DROP")}
 
 	// The accept rule is no longer required for a bridge with external connectivity, because
 	// ICC traffic is allowed by the outgoing-packets rule created by setupIptablesInternal.
@@ -526,6 +597,16 @@ func setIcc(version iptables.IPVersion, bridgeIface string, iccEnable, internal,
 	} else {
 		if err := dropRule.Delete(); err != nil {
 			log.G(context.TODO()).WithError(err).Warn("Failed to delete ICC drop rule")
+		}
+	}
+
+	// Delete rules that may have been inserted into the FORWARD chain by moby 28.0.0 or older.
+	if insert {
+		if err := acceptRule.WithChain("FORWARD").Delete(); err != nil {
+			return fmt.Errorf("deleting FORWARD chain accept rule: %w", err)
+		}
+		if err := dropRule.WithChain("FORWARD").Delete(); err != nil {
+			return fmt.Errorf("deleting FORWARD chain drop rule: %w", err)
 		}
 	}
 	return nil
@@ -608,6 +689,9 @@ func removeIPChains(version iptables.IPVersion) {
 	for _, chainInfo := range []iptables.ChainInfo{
 		{Name: DockerChain, Table: iptables.Nat, IPVersion: version},
 		{Name: DockerChain, Table: iptables.Filter, IPVersion: version},
+		{Name: DockerForwardChain, Table: iptables.Filter, IPVersion: version},
+		{Name: DockerBridgeChain, Table: iptables.Filter, IPVersion: version},
+		{Name: DockerCTChain, Table: iptables.Filter, IPVersion: version},
 		{Name: IsolationChain1, Table: iptables.Filter, IPVersion: version},
 		{Name: IsolationChain2, Table: iptables.Filter, IPVersion: version},
 		{Name: oldIsolationChain, Table: iptables.Filter, IPVersion: version},
@@ -754,15 +838,22 @@ func mirroredWSL2Workaround(config configuration, ipv iptables.IPVersion) error 
 //     the workaround, with improvements in WSL2 v2.3.11, and without userland proxy
 //     running - no workaround is needed, the normal DNAT/masquerading works.
 //   - and, the host Linux appears to be running under Windows WSL2 with mirrored
-//     mode networking. If a loopback0 device exists, and there's an executable at
-//     /usr/bin/wslinfo, infer that this is WSL2 with mirrored networking. ("wslinfo
-//     --networking-mode" reports "mirrored", but applying the workaround for WSL2's
-//     loopback device when it's not needed is low risk, compared with executing
-//     wslinfo with dockerd's elevated permissions.)
+//     mode networking.
 func insertMirroredWSL2Rule(config configuration) bool {
 	if !config.EnableUserlandProxy || config.UserlandProxyPath == "" {
 		return false
 	}
+	return isRunningUnderWSL2MirroredMode()
+}
+
+// isRunningUnderWSL2MirroredMode returns true if the host Linux appears to be
+// running under Windows WSL2 with mirrored mode networking. If a loopback0
+// device exists, and there's an executable at /usr/bin/wslinfo, infer that
+// this is WSL2 with mirrored networking. ("wslinfo --networking-mode" reports
+// "mirrored", but applying the workaround for WSL2's loopback device when it's
+// not needed is low risk, compared with executing wslinfo with dockerd's
+// elevated permissions.)
+func isRunningUnderWSL2MirroredMode() bool {
 	if _, err := nlwrap.LinkByName("loopback0"); err != nil {
 		if !errors.As(err, &netlink.LinkNotFoundError{}) {
 			log.G(context.TODO()).WithError(err).Warn("Failed to check for WSL interface")

@@ -21,9 +21,6 @@ import (
 )
 
 const (
-	// defaultStopSignal is the default syscall signal used to stop a container.
-	defaultStopSignal = "SIGTERM"
-
 	// defaultStopTimeout sets the default time, in seconds, to wait
 	// for the graceful container stop before forcefully terminating it.
 	defaultStopTimeout = 10
@@ -246,14 +243,6 @@ func (container *Container) UnmountSecrets() error {
 
 	return mount.RecursiveUnmount(p)
 }
-
-type conflictingUpdateOptions string
-
-func (e conflictingUpdateOptions) Error() string {
-	return string(e)
-}
-
-func (e conflictingUpdateOptions) Conflict() {}
 
 // UpdateContainer updates configuration of a container. Callers must hold a Lock on the Container.
 func (container *Container) UpdateContainer(hostConfig *containertypes.HostConfig) error {

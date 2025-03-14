@@ -11,7 +11,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	v2runcoptions "github.com/containerd/containerd/runtime/v2/runc/options"
+	runcoptions "github.com/containerd/containerd/api/types/runc/options"
 	"github.com/containerd/log"
 	"github.com/docker/docker/api/types"
 	containertypes "github.com/docker/docker/api/types/container"
@@ -158,6 +158,10 @@ func (daemon *Daemon) fillPlatformInfo(ctx context.Context, v *system.Info, sysI
 	}
 	if !v.IPv4Forwarding {
 		v.Warnings = append(v.Warnings, "WARNING: IPv4 forwarding is disabled")
+	}
+	// Env-var belonging to the bridge driver, disables use of the iptables "raw" table.
+	if os.Getenv("DOCKER_INSECURE_NO_IPTABLES_RAW") == "1" {
+		v.Warnings = append(v.Warnings, "WARNING: DOCKER_INSECURE_NO_IPTABLES_RAW is set")
 	}
 	return nil
 }
@@ -387,7 +391,7 @@ func parseDefaultRuntimeVersion(rts *runtimes) (runtime, version, commit string,
 	if err != nil {
 		return "", "", "", err
 	}
-	shimopts, ok := opts.(*v2runcoptions.Options)
+	shimopts, ok := opts.(*runcoptions.Options)
 	if !ok {
 		return "", "", "", fmt.Errorf("%s: retrieving version not supported", shim)
 	}

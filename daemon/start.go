@@ -4,14 +4,15 @@ import (
 	"context"
 	"time"
 
-	"github.com/containerd/containerd"
-	"github.com/containerd/containerd/containers"
+	containerd "github.com/containerd/containerd/v2/client"
+	"github.com/containerd/containerd/v2/core/containers"
 	"github.com/containerd/log"
 	"github.com/docker/docker/api/types/backend"
 	"github.com/docker/docker/api/types/events"
 	"github.com/docker/docker/container"
 	mobyc8dstore "github.com/docker/docker/daemon/containerd"
 	"github.com/docker/docker/errdefs"
+	"github.com/docker/docker/internal/metrics"
 	"github.com/docker/docker/libcontainerd"
 	"github.com/pkg/errors"
 	"go.opentelemetry.io/otel"
@@ -253,7 +254,7 @@ func (daemon *Daemon) containerStart(ctx context.Context, daemonCfg *configStore
 	}
 
 	daemon.LogContainerEvent(container, events.ActionStart)
-	containerActions.WithValues("start").UpdateSince(start)
+	metrics.ContainerActions.WithValues("start").UpdateSince(start)
 
 	return nil
 }
